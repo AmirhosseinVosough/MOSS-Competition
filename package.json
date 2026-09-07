@@ -1,0 +1,11 @@
+{
+  "name": "moss-latency-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "node bench/bench.js"
+  },
+  "dependencies": {
+    "@moss-dev/moss": "^1.7.1"
+  }
+}
