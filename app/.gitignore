@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+agent-py/.venv/
+
+# Build output
+frontend/.next/
+frontend/out/
+
+# Caches
+**/__pycache__/
+*.pyc
+agent-py/.ruff_cache/
+agent-py/.pytest_cache/
+
+# Local env
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/

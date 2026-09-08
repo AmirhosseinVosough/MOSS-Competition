@@ -1,0 +1,67 @@
+[
+  {
+    "id": "kb-rag-pattern",
+    "text": "Q: How should a LiveKit voice agent perform retrieval-augmented generation (RAG)? A: Override the on_user_turn_completed node (in livekit.agents) to run a semantic search against your knowledge index using the user's most recent turn, then inject the retrieved snippets into the chat context before the LLM generates its reply. Doing the lookup in this node avoids the extra round-trips of tool calls, so it is usually more responsive than a function-tool lookup. In this starter, the lookup queries the Moss 'knowledge' index via MossClient.query.",
+    "metadata": { "category": "patterns", "topic": "rag" }
+  },
+  {
+    "id": "kb-agentic-memory",
+    "text": "Q: How can a voice agent remember things across sessions? A: Expose explicit memory tools such as remember, recall, forget, and search_memory as function tools so the LLM itself decides what to persist and when to retrieve it. Back these tools with a per-user store; in this starter that store is a separate Moss 'memory' index, keyed by a user_id in each document's metadata, so a user's memories stay isolated from the static knowledge base.",
+    "metadata": { "category": "patterns", "topic": "memory" }
+  },
+  {
+    "id": "kb-interruptions",
+    "text": "Q: How do voice agents handle being interrupted mid-reply, and how do I protect critical actions? A: By default the agent detects user speech during playback and pauses its current reply so the conversation feels natural. For function tools that mutate external state (placing an order, sending a payment), an interruption can leave the operation half-finished with no rollback, so call context.disallow_interruptions() at the start of the tool (Python) to make that turn uninterruptible until it completes.",
+    "metadata": { "category": "voice-agents", "topic": "interruptions" }
+  },
+  {
+    "id": "kb-turn-detection",
+    "text": "Q: How does a LiveKit agent know when the user has finished speaking? A: Turn detection decides when the user's turn ends so the agent can reply without cutting them off. This starter uses the turn_detector MultilingualModel() plug-in as the turn detector, combined with Silero VAD for voice-activity cues. Alternatives for the turn_detection option include 'stt' (end-of-utterance cues from the STT model), 'vad', 'realtime_llm' (server-side detection from a realtime LLM), or 'manual' for explicit control.",
+    "metadata": { "category": "voice-agents", "topic": "turn-detection" }
+  },
+  {
+    "id": "kb-stt-choice",
+    "text": "Q: How do I choose a speech-to-text (STT) provider for a realtime voice agent? A: With LiveKit Inference you select an STT model by name without wiring up provider API keys, since the provider runs server-side. This starter uses inference.STT(model='deepgram/nova-3', language='multi'). For realtime conversation, prefer models with strong streaming and built-in endpointing, and set the language to 'multi' when you need multilingual transcription.",
+    "metadata": { "category": "models", "topic": "stt" }
+  },
+  {
+    "id": "kb-tts-choice",
+    "text": "Q: How is text-to-speech (TTS) configured in this starter? A: TTS is provided through LiveKit Inference, so no provider key is needed in the agent. The starter uses inference.TTS(model='cartesia/sonic-3', voice='<voice-id>'). To change the agent's voice, pick a different voice id for the same model, or switch to another Inference TTS model; the rest of the AgentSession wiring stays the same.",
+    "metadata": { "category": "models", "topic": "tts" }
+  },
+  {
+    "id": "kb-llm-inference",
+    "text": "Q: How is the LLM wired up without provider API keys? A: LiveKit Inference proxies the model call, so you reference a model by name instead of holding an OpenAI/Anthropic key in the agent. This starter uses inference.LLM(model='openai/gpt-5.2-chat-latest'). Only LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET are required for STT, LLM, and TTS to work through Inference.",
+    "metadata": { "category": "models", "topic": "llm" }
+  },
+  {
+    "id": "kb-preemptive-generation",
+    "text": "Q: What is preemptive (speculative) speech generation and what is its trade-off? A: With preemptive_generation=True the agent speculatively starts generating (and can run TTS) on the LLM response before the user's turn is fully finalized, reducing perceived latency. The trade-off is wasted compute and higher LLM token usage: if the chat context or tools change in the on_user_turn_completed node — for example after a RAG injection — the speculative response is discarded and regenerated.",
+    "metadata": { "category": "voice-agents", "topic": "latency" }
+  },
+  {
+    "id": "kb-noise-cancellation",
+    "text": "Q: How does this starter improve audio quality in noisy environments? A: It applies noise cancellation on the input audio using the ai_coustics plug-in, configured through room_io.AudioInputOptions when the AgentSession's room input is set up. Cleaning the user's audio before STT improves transcription accuracy and turn detection, especially on calls or in noisy rooms.",
+    "metadata": { "category": "voice-agents", "topic": "audio" }
+  },
+  {
+    "id": "kb-metrics-usage",
+    "text": "Q: How do I collect cost and usage metrics from an agent session? A: For session-scoped cost and usage tracking, use the session usage surface to aggregate per-model usage across the conversation and export a summary when the session ends. For finer granularity, subscribe to the per-plugin metrics_collected event on each component (STT, LLM, TTS, VAD). Note the older session-level metrics_collected event (session.on('metrics_collected', ...)) is deprecated in favor of the per-plugin event and session usage.",
+    "metadata": { "category": "deployment", "topic": "telemetry" }
+  },
+  {
+    "id": "kb-agentserver-pattern",
+    "text": "Q: How is the agent process structured in this starter? A: It uses the AgentServer pattern from livekit.agents rather than WorkerOptions/entrypoint. You create server = AgentServer(), assign server.setup_fnc = prewarm to load Silero VAD into proc.userdata['vad'], and decorate the session handler with @server.rtc_session(agent_name='agent-py') on an async function that takes a JobContext. The process runs via cli.run_app(server) under if __name__ == '__main__'.",
+    "metadata": { "category": "voice-agents", "topic": "architecture" }
+  },
+  {
+    "id": "kb-explicit-dispatch",
+    "text": "Q: How do I make the frontend dispatch to this specific Python agent? A: The agent registers under agent_name='agent-py' in its @server.rtc_session decorator. For explicit dispatch, the frontend must request that same name: set AGENT_NAME=agent-py in the frontend's .env.local, which flows into app-config.ts (agentName) and the room configuration's agents list. If AGENT_NAME is left blank, the room uses automatic dispatch instead.",
+    "metadata": { "category": "deployment", "topic": "dispatch" }
+  },
+  {
+    "id": "kb-prewarm-vad",
+    "text": "Q: Why and how is Silero VAD prewarmed? A: Loading the VAD model is relatively expensive, so it is loaded once at process startup instead of per session. The starter sets server.setup_fnc = prewarm, and prewarm loads silero.VAD into proc.userdata['vad']; each new session then reuses that cached VAD instance, reducing first-response latency for the very first call the worker handles.",
+    "metadata": { "category": "voice-agents", "topic": "performance" }
+  }
+]
