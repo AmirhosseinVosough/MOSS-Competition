@@ -34,7 +34,11 @@ DOCS = int(os.environ.get("DOCS", 2000))
 TOPK = int(os.environ.get("TOPK", 5))
 ITERS = int(os.environ.get("ITERS", 200))
 MODEL = os.environ.get("MODEL", "moss-minilm")
-INDEX = f"bench-{MODEL}-{DOCS}"
+# Point at an existing index (e.g. the Moss starter) to benchmark for free.
+INDEX = os.environ.get("INDEX") or f"bench-{MODEL}-{DOCS}"
+OWN_INDEX = INDEX.startswith("bench-")
+# Never write into an index we did not create unless explicitly allowed.
+ALLOW_WRITES = OWN_INDEX or os.environ.get("ALLOW_SESSION_WRITES") == "1"
 
 if not PROJECT_ID or not PROJECT_KEY:
     sys.exit(
@@ -114,6 +118,26 @@ PARTIALS = [
 ]
 
 
+def fake_vec(seed, dim):
+    """Deterministic unit vector. Content is irrelevant to search latency."""
+    import math, random
+    r = random.Random(seed)
+    v = [r.gauss(0, 1) for _ in range(dim)]
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+async def probe_text_queries(client):
+    """Some indexes (dashboard-created) refuse text queries and demand vectors."""
+    try:
+        await client.query(INDEX, "test", QueryOptions(top_k=1))
+        return True
+    except Exception as e:
+        if "explicit query embeddings" in str(e):
+            return False
+        raise
+
+
 async def detect_embedding_dim(client):
     """Results don't expose embeddings, so probe for the expected vector width."""
     for dim in (384, 768, 512, 1024, 256):
@@ -164,15 +188,27 @@ async def main():
     print(f"      loaded in {load_ms:.0f}ms  <-- cold-start budget on deploy")
     results["load_ms"] = round(load_ms)
 
-    # --- 3. steady-state query latency (includes embedding generation) ---
-    print(f"[3/6] query latency, {ITERS} iters (embedding generated per query)...")
+    text_ok = await probe_text_queries(client)
+    dim = None
+    if not text_ok:
+        dim = await detect_embedding_dim(client)
+        print(f"      NOTE: this index requires pre-computed vectors (dim={dim}).")
+        print(f"      Measuring pure search speed, excluding embedding generation.")
+        results["mode"] = "embedding_only"
+        results["embedding_dim"] = dim
+
+    # --- 3. steady-state query latency ---
+    print(f"[3/6] query latency, {ITERS} iters...")
+    def q(i):
+        if text_ok:
+            return client.query(INDEX, QUERIES[i % len(QUERIES)], QueryOptions(top_k=TOPK))
+        return client.query(INDEX, "", QueryOptions(top_k=TOPK, embedding=fake_vec(i % 20, dim)))
+
     for i in range(20):  # warm
-        await client.query(INDEX, QUERIES[i % len(QUERIES)], QueryOptions(top_k=TOPK))
+        await q(i)
     q_lat, q_self = [], []
     for i in range(ITERS):
-        ms, r = await timed(
-            client.query(INDEX, QUERIES[i % len(QUERIES)], QueryOptions(top_k=TOPK))
-        )
+        ms, r = await timed(q(i))
         q_lat.append(ms)
         t = getattr(r, "time_taken_ms", None)
         if isinstance(t, (int, float)):
@@ -185,8 +221,10 @@ async def main():
     # If embedding generation dominates, reusing a vector makes repeat queries far cheaper.
     print("[4/6] precomputed-embedding query path...")
     emb_stats = None
-    dim = await detect_embedding_dim(client)
-    if dim:
+    if not text_ok:
+        print("      same as stage 3 in this mode; skipping.")
+        dim = dim
+    elif (dim := await detect_embedding_dim(client)):
         print(f"      embedding dim = {dim}")
         vec = [0.01] * dim
         arr = []
@@ -206,15 +244,18 @@ async def main():
     print(f"[5/6] burst — {len(PARTIALS)} queries per utterance, sequential + concurrent...")
     seq, par = [], []
     for _ in range(30):
+        def bq(j):
+            if text_ok:
+                return client.query(INDEX, PARTIALS[j], QueryOptions(top_k=TOPK))
+            return client.query(INDEX, "", QueryOptions(top_k=TOPK, embedding=fake_vec(j, dim)))
+
         t = time.perf_counter()
-        for p in PARTIALS:
-            await client.query(INDEX, p, QueryOptions(top_k=TOPK))
+        for j in range(len(PARTIALS)):
+            await bq(j)
         seq.append((time.perf_counter() - t) * 1000)
 
         t = time.perf_counter()
-        await asyncio.gather(
-            *[client.query(INDEX, p, QueryOptions(top_k=TOPK)) for p in PARTIALS]
-        )
+        await asyncio.gather(*[bq(j) for j in range(len(PARTIALS))])
         par.append((time.perf_counter() - t) * 1000)
     results["burst_sequential"] = stats(seq)
     results["burst_concurrent"] = stats(par)
@@ -222,7 +263,13 @@ async def main():
     # --- 6. local mutable session: write latency ---
     # SessionIndex.add_docs is local (no cloud job polling) — the agent-memory path.
     print("[6/6] SessionIndex local write + query...")
+    if not ALLOW_WRITES:
+        print("      skipped — not our index, refusing to write into it.")
+        print("      (local-only, but set ALLOW_SESSION_WRITES=1 if you want it)")
+        results["session_skipped"] = "foreign index"
     try:
+        if not ALLOW_WRITES:
+            raise RuntimeError("skipped")
         session = await client.session(INDEX, MODEL)
         w_lat, sq_lat = [], []
         for i in range(50):
@@ -242,8 +289,9 @@ async def main():
         results["session_write"] = stats(w_lat)
         results["session_query_after_write"] = stats(sq_lat)
     except Exception as e:
-        print(f"      session path unavailable: {e}")
-        results["session_error"] = str(e)
+        if str(e) != "skipped":
+            print(f"      session path unavailable: {e}")
+            results["session_error"] = str(e)
 
     # ---------- report ----------
     bar = "=" * 96
