@@ -39,6 +39,15 @@ MEMORY_INDEX = os.getenv("MOSS_MEMORY_INDEX_NAME", "memory")
 # per-browser user_id via agent dispatch metadata.
 DEFAULT_USER_ID = "user_1"
 
+# Categories that are small, bounded, and unsafe to sample. Ranking exists to trim
+# large result sets; these have nothing to trim, and picking a "best" allergy is how
+# a severe one goes unmentioned. list_care_category returns every document in one.
+SWEEPABLE_CATEGORIES = ("allergy", "medication", "appointment", "contact", "medical_alert")
+
+# Measured on the 41-document care index: pure semantic beat every hybrid setting
+# (6/6 correct vs 5/6), and keyword-leaning pulled in unrelated documents.
+SEARCH_ALPHA = 1.0
+
 
 class Assistant(Agent):
     """Voice agent that wires Moss retrieval + per-user memory into LiveKit."""
@@ -60,7 +69,15 @@ class Assistant(Agent):
 
                 - Before saying ANYTHING about a medicine, a dose, a time, a
                   date, an appointment, an allergy, or a phone number, you MUST
-                  call `search_care_notes` and use what comes back.
+                  look it up and use what comes back.
+                - If he asks about one specific thing, use `search_care_notes`.
+                - If he asks about a whole group -- what he is allergic to, what
+                  medicines he takes, what appointments are coming up, who he can
+                  call -- use `list_care_category` instead. It returns every note
+                  in that group. Searching would return only the closest few and
+                  could leave out something that matters.
+                - When you read out allergies, always say the serious ones
+                  first.
                 - Never state a dose, a time, a date, or a number that did not
                   appear in the notes you retrieved. Not a guess, not a
                   reasonable assumption, not something you recall from earlier.
@@ -218,7 +235,7 @@ class Assistant(Agent):
             query: What to look up, in the user's own words.
         """
         result = await self._moss.query(
-            KNOWLEDGE_INDEX, query, QueryOptions(top_k=3)
+            KNOWLEDGE_INDEX, query, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
         )
         await self._publish_moss_context(query, result)
 
@@ -228,6 +245,50 @@ class Assistant(Agent):
         if not snippets:
             return "No relevant documentation was found for that question."
         return "\n\n".join(snippets)
+
+    @function_tool()
+    async def list_care_category(self, context: RunContext, category: str) -> str:
+        """List every note in one category of Bill's records, leaving none out.
+
+        Use this instead of `search_care_notes` whenever the question is about a
+        whole group rather than one item -- "what am I allergic to", "what
+        medicines do I take", "what appointments have I got coming up", "who can
+        I call". Searching ranks notes and returns only the closest few, which
+        can leave out something important; this returns all of them.
+
+        Args:
+            category: One of allergy, medication, appointment, contact,
+                      medical_alert.
+        """
+        category = (category or "").strip().lower()
+        if category not in SWEEPABLE_CATEGORIES:
+            return (
+                f"'{category}' is not a category I can list. "
+                f"Valid categories: {', '.join(SWEEPABLE_CATEGORIES)}."
+            )
+
+        # top_k is deliberately far above the real count so nothing is truncated.
+        result = await self._moss.query(
+            KNOWLEDGE_INDEX,
+            category,
+            QueryOptions(
+                top_k=25,
+                filter={"field": "category", "condition": {"$eq": category}},
+            ),
+        )
+        await self._publish_moss_context(f"all {category} notes", result)
+
+        docs = getattr(result, "docs", None) or []
+        # Severe first, so the most important note is never buried at the bottom.
+        docs = sorted(
+            docs,
+            key=lambda d: 0 if (d.metadata or {}).get("severity") == "severe" else 1,
+        )
+        notes = [(getattr(d, "text", "") or "").strip() for d in docs]
+        notes = [n for n in notes if n]
+        if not notes:
+            return f"There are no {category} notes on file."
+        return "\n".join(notes)
 
     @function_tool()
     async def remember_fact(self, context: RunContext, fact: str) -> str:
