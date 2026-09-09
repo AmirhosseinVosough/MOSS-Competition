@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import json
 import logging
@@ -34,10 +35,45 @@ load_dotenv(".env.local")
 KNOWLEDGE_INDEX = os.getenv("MOSS_INDEX_NAME", "knowledge")
 MEMORY_INDEX = os.getenv("MOSS_MEMORY_INDEX_NAME", "memory")
 
+# Whose care records these are. Memory is scoped to the person being cared for,
+# not to the browser that happens to be connected: Bill may speak from more than
+# one device, and Sarah must see the same history he does. The starter's
+# per-browser user_id was right for a multi-tenant docs bot and wrong here.
+PATIENT_ID = os.getenv("PATIENT_ID", "bill")
+
 # Fallback identity used only when ctx.job.metadata is absent (e.g. when
-# running `uv run src/agent.py console`). The frontend provides a real
-# per-browser user_id via agent dispatch metadata.
+# running `uv run src/agent.py console`). Retained for logging and dispatch;
+# it no longer scopes memory.
 DEFAULT_USER_ID = "user_1"
+
+# One Moss client per worker process, with its knowledge index already loaded.
+# Building it per conversation cost ~2.5s of silence at the start of every call,
+# because each Assistant created its own client and re-downloaded the index.
+_shared_client: MossClient | None = None
+_shared_client_lock = asyncio.Lock()
+
+
+async def get_shared_client() -> MossClient:
+    """Return the process-wide Moss client, loading the knowledge index once.
+
+    The lock matters: without it two callers arriving together would both see an
+    empty slot and both pay the load.
+    """
+    global _shared_client
+    async with _shared_client_lock:
+        if _shared_client is None:
+            client = MossClient(
+                os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")
+            )
+            started = time.perf_counter()
+            await client.load_index(KNOWLEDGE_INDEX)
+            logger.info(
+                "Loaded Moss knowledge index '%s' in %.0fms (once per worker)",
+                KNOWLEDGE_INDEX,
+                (time.perf_counter() - started) * 1000,
+            )
+            _shared_client = client
+    return _shared_client
 
 # Categories that are small, bounded, and unsafe to sample. Ranking exists to trim
 # large result sets; these have nothing to trim, and picking a "best" allergy is how
@@ -121,10 +157,9 @@ class Assistant(Agent):
         )
         self._room = room
         self._user_id = user_id
-        self._moss = MossClient(
-            os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")
-        )
-        self._indexes_loaded = False
+        # Assigned in on_enter from the process-wide client, which already has
+        # the knowledge index loaded.
+        self._moss: MossClient | None = None
         # Local, mutable view of the memory index. Writes land in process memory
         # instead of triggering a cloud rebuild + full re-download, which measured
         # 4257ms per fact (bench/bench_memory.py). Local writes measure ~4.5ms.
@@ -142,13 +177,12 @@ class Assistant(Agent):
         # the documented LiveKit pattern. Keeping `on_enter` side-effect-free for
         # speech keeps `session.start(Assistant())` deterministic for the evals
         # in tests/test_agent.py (a single turn yields a single reply).
-        if not self._indexes_loaded:
+        if self._moss is None:
             try:
-                await self._moss.load_index(KNOWLEDGE_INDEX)
-                self._indexes_loaded = True
-                logger.info("Loaded Moss knowledge index '%s'", KNOWLEDGE_INDEX)
+                self._moss = await get_shared_client()
             except Exception:
-                logger.exception("Failed to preload knowledge index; will retry on use")
+                logger.exception("Could not obtain shared Moss client")
+                return
 
         # Open a writable local session over the memory index. session() adopts the
         # stored model, so model_id is deliberately omitted -- passing one that
@@ -301,29 +335,29 @@ class Assistant(Agent):
             fact: A short, self-contained statement of the fact to remember.
         """
         doc = DocumentInfo(
-            id=f"{self._user_id}-{uuid.uuid4()}",
+            id=f"{PATIENT_ID}-{uuid.uuid4()}",
             text=fact,
-            metadata={"user_id": self._user_id},
+            metadata={"patient_id": PATIENT_ID},
         )
+        if self._memory_session is None:
+            # There is deliberately no cloud fallback here. push_index() marks the
+            # index as using custom embeddings, after which plain-text cloud
+            # queries against it raise -- so a cloud write would succeed and then
+            # be unreadable. Failing honestly beats writing somewhere we cannot
+            # read back.
+            logger.error("remember_fact: no memory session; fact not stored")
+            return (
+                "I'm sorry, I can't hold on to that at the moment. "
+                "It would be worth telling Sarah instead."
+            )
+
         started = time.perf_counter()
-
-        if self._memory_session is not None:
-            # Local write: searchable immediately, no rebuild, no re-download.
-            await self._memory_session.add_docs([doc])
-            self._memory_dirty = True
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            logger.info("remember_fact: local write in %.2fms", elapsed_ms)
-        else:
-            # Fallback path: the original cloud write, kept so a session failure
-            # degrades the agent's latency rather than breaking its memory.
-            await self._moss.add_docs(MEMORY_INDEX, [doc])
-            try:
-                await self._moss.load_index(MEMORY_INDEX)
-            except Exception:
-                logger.exception("Failed to reload memory index after write")
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            logger.warning("remember_fact: cloud fallback write in %.0fms", elapsed_ms)
-
+        await self._memory_session.add_docs([doc])
+        self._memory_dirty = True
+        logger.info(
+            "remember_fact: local write in %.2fms",
+            (time.perf_counter() - started) * 1000,
+        )
         return "Got it, I'll remember that."
 
     @function_tool()
@@ -339,16 +373,20 @@ class Assistant(Agent):
         options = QueryOptions(
             top_k=5,
             filter={
-                "field": "user_id",
-                "condition": {"$eq": self._user_id},
+                "field": "patient_id",
+                "condition": {"$eq": PATIENT_ID},
             },
         )
-        # Read through the session when we have one: facts written this turn are
-        # only present in the local copy until on_exit pushes them.
-        if self._memory_session is not None:
-            result = await self._memory_session.query(query, options)
-        else:
-            result = await self._moss.query(MEMORY_INDEX, query, options)
+        # Reads go through the session for two reasons: facts written this turn
+        # exist only in the local copy until on_exit pushes them, and the session
+        # holds the embedding model, so it can answer text queries against an
+        # index that push_index() has marked as using custom embeddings. The
+        # cloud client cannot.
+        if self._memory_session is None:
+            logger.error("recall_facts: no memory session; cannot read memory")
+            return "I'm sorry, I can't call anything to mind just now."
+
+        result = await self._memory_session.query(query, options)
         await self._publish_moss_context(query, result)
 
         docs = getattr(result, "docs", None) or []
@@ -364,6 +402,12 @@ server = AgentServer()
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
+    # Pull the knowledge index in before any caller arrives. Best-effort: if this
+    # fails, get_shared_client() still loads it lazily on the first conversation.
+    try:
+        asyncio.run(get_shared_client())
+    except Exception:
+        logger.exception("Prewarm of Moss index failed; will load on first use")
 
 
 server.setup_fnc = prewarm

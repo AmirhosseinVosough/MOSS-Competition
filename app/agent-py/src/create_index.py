@@ -72,13 +72,13 @@ def _memory_seed_documents() -> list[DocumentInfo]:
     """A single placeholder doc so the memory index exists and loads cleanly.
 
     The agent's memory tools upsert real per-user documents at runtime (matching
-    ``id`` upserts). This seed is filtered out at query time by its ``user_id``.
+    ``id`` upserts). This seed is filtered out at query time by its ``patient_id``.
     """
     return [
         DocumentInfo(
             id="__seed__",
             text="(memory seed) placeholder document so the memory index can be loaded before the first write.",
-            metadata={"user_id": "__seed__"},
+            metadata={"patient_id": "__seed__"},
         )
     ]
 
