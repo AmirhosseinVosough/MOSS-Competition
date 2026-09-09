@@ -1,1 +1,3 @@
-moss>=1.8.0
+# Pinned to match app/agent-py so benchmarks measure what the app actually runs.
+# The app's version comes from app/agent-py/uv.lock — keep these in step.
+moss==1.4.0

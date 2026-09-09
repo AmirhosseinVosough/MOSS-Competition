@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import textwrap
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -99,10 +100,17 @@ class Assistant(Agent):
             os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")
         )
         self._indexes_loaded = False
+        # Local, mutable view of the memory index. Writes land in process memory
+        # instead of triggering a cloud rebuild + full re-download, which measured
+        # 4257ms per fact (bench/bench_memory.py). Local writes measure ~4.5ms.
+        # Falls back to the cloud path if the session cannot be created.
+        self._memory_session = None
+        self._memory_dirty = False
 
     async def on_enter(self) -> None:
-        # Preload both Moss indexes so the first query is fast. Guarded: log and
-        # continue on failure so the tools can still retry the load on use.
+        # Preload the knowledge index and open a writable session over memory so
+        # the first query is fast. Guarded: log and continue on failure so the
+        # tools can still retry on use.
         #
         # Note: the spoken greeting is intentionally triggered from the
         # entrypoint (after `session.start`/`ctx.connect`) rather than here, per
@@ -112,15 +120,41 @@ class Assistant(Agent):
         if not self._indexes_loaded:
             try:
                 await self._moss.load_index(KNOWLEDGE_INDEX)
-                await self._moss.load_index(MEMORY_INDEX)
                 self._indexes_loaded = True
-                logger.info(
-                    "Loaded Moss indexes '%s' and '%s'",
-                    KNOWLEDGE_INDEX,
-                    MEMORY_INDEX,
-                )
+                logger.info("Loaded Moss knowledge index '%s'", KNOWLEDGE_INDEX)
             except Exception:
-                logger.exception("Failed to preload Moss indexes; will retry on use")
+                logger.exception("Failed to preload knowledge index; will retry on use")
+
+        # Open a writable local session over the memory index. session() adopts the
+        # stored model, so model_id is deliberately omitted -- passing one that
+        # disagrees with the index raises.
+        if self._memory_session is None:
+            try:
+                self._memory_session = await self._moss.session(MEMORY_INDEX)
+                logger.info("Opened local Moss session for '%s'", MEMORY_INDEX)
+            except Exception:
+                logger.exception(
+                    "Could not open memory session; falling back to cloud writes"
+                )
+                try:
+                    await self._moss.load_index(MEMORY_INDEX)
+                except Exception:
+                    logger.exception("Failed to load memory index for fallback reads")
+
+    async def on_exit(self) -> None:
+        # Persist locally-written facts so they survive into the next session.
+        # Deliberately deferred to teardown: push_index triggers a cloud rebuild,
+        # which is exactly the multi-second stall we removed from remember_fact.
+        if self._memory_session is not None and self._memory_dirty:
+            try:
+                result = await self._memory_session.push_index()
+                logger.info(
+                    "Pushed memory session to cloud (docs=%s)",
+                    getattr(result, "doc_count", "?"),
+                )
+                self._memory_dirty = False
+            except Exception:
+                logger.exception("Failed to push memory session to cloud")
 
     async def _publish_moss_context(self, query: str, result) -> None:
         """Publish a `moss_context` data message for the frontend panel.
@@ -198,14 +232,25 @@ class Assistant(Agent):
             text=fact,
             metadata={"user_id": self._user_id},
         )
-        await self._moss.add_docs(MEMORY_INDEX, [doc])
-        # Reload so the new fact is immediately queryable by recall_facts.
-        # Conservative per Moss guidance to re-load after writes; live-verified
-        # in Task 9.
-        try:
-            await self._moss.load_index(MEMORY_INDEX)
-        except Exception:
-            logger.exception("Failed to reload memory index after write")
+        started = time.perf_counter()
+
+        if self._memory_session is not None:
+            # Local write: searchable immediately, no rebuild, no re-download.
+            await self._memory_session.add_docs([doc])
+            self._memory_dirty = True
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.info("remember_fact: local write in %.2fms", elapsed_ms)
+        else:
+            # Fallback path: the original cloud write, kept so a session failure
+            # degrades the agent's latency rather than breaking its memory.
+            await self._moss.add_docs(MEMORY_INDEX, [doc])
+            try:
+                await self._moss.load_index(MEMORY_INDEX)
+            except Exception:
+                logger.exception("Failed to reload memory index after write")
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.warning("remember_fact: cloud fallback write in %.0fms", elapsed_ms)
+
         return "Got it, I'll remember that."
 
     @function_tool()
@@ -218,17 +263,19 @@ class Assistant(Agent):
         Args:
             query: What you want to recall about the user.
         """
-        result = await self._moss.query(
-            MEMORY_INDEX,
-            query,
-            QueryOptions(
-                top_k=5,
-                filter={
-                    "field": "user_id",
-                    "condition": {"$eq": self._user_id},
-                },
-            ),
+        options = QueryOptions(
+            top_k=5,
+            filter={
+                "field": "user_id",
+                "condition": {"$eq": self._user_id},
+            },
         )
+        # Read through the session when we have one: facts written this turn are
+        # only present in the local copy until on_exit pushes them.
+        if self._memory_session is not None:
+            result = await self._memory_session.query(query, options)
+        else:
+            result = await self._moss.query(MEMORY_INDEX, query, options)
         await self._publish_moss_context(query, result)
 
         docs = getattr(result, "docs", None) or []
