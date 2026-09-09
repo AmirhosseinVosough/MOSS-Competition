@@ -79,10 +79,10 @@ def stub_moss(monkeypatch):
     monkeypatch.setattr(agent_module, "MossClient", _FakeMossClient)
 
 
-async def test_search_knowledge_returns_joined_text_and_publishes_context(
+async def test_search_care_notes_returns_joined_text_and_publishes_context(
     stub_moss,
 ) -> None:
-    """search_knowledge joins snippets and publishes a well-formed payload."""
+    """search_care_notes joins snippets and publishes a well-formed payload."""
     room = _FakeRoom()
     assistant = Assistant(room=room, user_id=USER_ID)
     assistant._moss.query_result = _FakeSearchResult(
@@ -93,7 +93,7 @@ async def test_search_knowledge_returns_joined_text_and_publishes_context(
         time_taken_ms=7.0,
     )
 
-    result = await assistant.search_knowledge(None, "how does turn detection work?")
+    result = await assistant.search_care_notes(None, "how does turn detection work?")
 
     # Returns the snippets joined as plain text.
     assert result == "First snippet.\n\nSecond snippet."

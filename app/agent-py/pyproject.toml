@@ -34,6 +34,8 @@ where = ["src"]
 "" = "src"
 
 [tool.pytest.ini_options]
+# tests do `from agent import Assistant`, so src/ must be importable
+pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

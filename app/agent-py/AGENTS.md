@@ -31,7 +31,7 @@ The agent reads and writes two Moss indexes (names overridable via `MOSS_INDEX_N
 
 The `Assistant` (in `src/agent.py`) exposes three `@function_tool()` methods:
 
-- **`search_knowledge(query)`** — queries the `knowledge` index (RAG), returns the joined snippet text, and publishes a `moss_context` data message to the room for the frontend context panel.
+- **`search_care_notes(query)`** — queries the `knowledge` index (RAG), returns the joined snippet text, and publishes a `moss_context` data message to the room for the frontend context panel.
 - **`remember_fact(fact)`** — upserts a document into the `memory` index via `add_docs`, tagged with the current user's `user_id` metadata.
 - **`recall_facts(query)`** — queries the `memory` index filtered to the current user (`filter={"field": "user_id", "condition": {"$eq": <user_id>}}`) and publishes a `moss_context` message.
 

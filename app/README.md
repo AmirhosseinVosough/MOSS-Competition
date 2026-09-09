@@ -1,7 +1,7 @@
 # Moss Hacker Starter — LiveKit voice agent + Moss RAG & memory
 
 A voice AI starter that pairs the official **[LiveKit](https://livekit.io) Agents** stack with
-**[Moss](https://usemoss.dev)** for retrieval. Talk to a "LiveKit docs helper" in the browser; it
+**[Moss](https://usemoss.dev)** for retrieval. Talk to a voice care companion in the browser; it
 answers grounded in a Moss knowledge base (RAG) and remembers facts you tell it (agentic memory),
 scoped per user.
 
@@ -13,7 +13,7 @@ idioms.
 
 - **Voice agent** (`agent-py/`) — a Python LiveKit agent (`AgentServer` + `@server.rtc_session`)
   with three tools:
-  - `search_knowledge` — semantic search (RAG) over the static **`knowledge`** Moss index.
+  - `search_care_notes` — semantic search (RAG) over the static **`knowledge`** Moss index.
   - `remember_fact` — writes a fact to the **`memory`** Moss index, tagged with your `user_id`.
   - `recall_facts` — reads back *your* facts only, via a per-user metadata filter.
 - **Frontend** (`frontend/`) — the React/Next.js starter, rebranded as the "Moss LiveKit Docs
@@ -45,7 +45,7 @@ API keys** to manage anywhere in this repo.
              │                          ┌────────────────────────────┐
              │   moss_context data ◀────│  Python voice agent         │
              └──────── packets ─────────│  (agent-py/, AgentServer)   │
-                                        │  search_knowledge / remember │
+                                        │  search_care_notes / remember │
                                         │  _fact / recall_facts        │
                                         └─────────────┬──────────────┘
                                                       │  Moss SDK
@@ -177,7 +177,7 @@ pnpm agent:py:console
 
 With `pnpm dev` running, connect at http://localhost:3000 and:
 
-1. **RAG / `search_knowledge`** — ask a docs question, e.g.
+1. **RAG / `search_care_notes`** — ask a docs question, e.g.
    *"How does turn detection work in LiveKit?"*
    The agent searches the `knowledge` index, answers grounded in the snippets, and the
    **Knowledge Matches** panel fills in with the retrieved chunks + relevance scores.

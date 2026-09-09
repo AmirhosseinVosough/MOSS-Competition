@@ -1,67 +1,187 @@
 [
   {
-    "id": "kb-rag-pattern",
-    "text": "Q: How should a LiveKit voice agent perform retrieval-augmented generation (RAG)? A: Override the on_user_turn_completed node (in livekit.agents) to run a semantic search against your knowledge index using the user's most recent turn, then inject the retrieved snippets into the chat context before the LLM generates its reply. Doing the lookup in this node avoids the extra round-trips of tool calls, so it is usually more responsive than a function-tool lookup. In this starter, the lookup queries the Moss 'knowledge' index via MossClient.query.",
-    "metadata": { "category": "patterns", "topic": "rag" }
+    "id": "med-metformin",
+    "text": "Metformin 500mg. Take one tablet twice daily, with breakfast and with the evening meal. Never take it on an empty stomach. Prescribed by Dr. Patel for type 2 diabetes.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "drug": "metformin", "dose": "500mg"}
   },
   {
-    "id": "kb-agentic-memory",
-    "text": "Q: How can a voice agent remember things across sessions? A: Expose explicit memory tools such as remember, recall, forget, and search_memory as function tools so the LLM itself decides what to persist and when to retrieve it. Back these tools with a per-user store; in this starter that store is a separate Moss 'memory' index, keyed by a user_id in each document's metadata, so a user's memories stay isolated from the static knowledge base.",
-    "metadata": { "category": "patterns", "topic": "memory" }
+    "id": "med-lisinopril",
+    "text": "Lisinopril 10mg. Take one tablet each morning, before breakfast. For blood pressure. If a dose is missed, skip it and take the next one at the usual time. Do not double up.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "drug": "lisinopril", "dose": "10mg"}
   },
   {
-    "id": "kb-interruptions",
-    "text": "Q: How do voice agents handle being interrupted mid-reply, and how do I protect critical actions? A: By default the agent detects user speech during playback and pauses its current reply so the conversation feels natural. For function tools that mutate external state (placing an order, sending a payment), an interruption can leave the operation half-finished with no rollback, so call context.disallow_interruptions() at the start of the tool (Python) to make that turn uninterruptible until it completes.",
-    "metadata": { "category": "voice-agents", "topic": "interruptions" }
+    "id": "med-atorvastatin",
+    "text": "Atorvastatin 20mg. Take one tablet at bedtime. For cholesterol. Avoid grapefruit and grapefruit juice while taking this medicine.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "drug": "atorvastatin", "dose": "20mg"}
   },
   {
-    "id": "kb-turn-detection",
-    "text": "Q: How does a LiveKit agent know when the user has finished speaking? A: Turn detection decides when the user's turn ends so the agent can reply without cutting them off. This starter uses the turn_detector MultilingualModel() plug-in as the turn detector, combined with Silero VAD for voice-activity cues. Alternatives for the turn_detection option include 'stt' (end-of-utterance cues from the STT model), 'vad', 'realtime_llm' (server-side detection from a realtime LLM), or 'manual' for explicit control.",
-    "metadata": { "category": "voice-agents", "topic": "turn-detection" }
+    "id": "med-aspirin",
+    "text": "Aspirin 75mg. Take one tablet daily after lunch. Low dose, for heart protection. Take with food to protect the stomach.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "drug": "aspirin", "dose": "75mg"}
   },
   {
-    "id": "kb-stt-choice",
-    "text": "Q: How do I choose a speech-to-text (STT) provider for a realtime voice agent? A: With LiveKit Inference you select an STT model by name without wiring up provider API keys, since the provider runs server-side. This starter uses inference.STT(model='deepgram/nova-3', language='multi'). For realtime conversation, prefer models with strong streaming and built-in endpointing, and set the language to 'multi' when you need multilingual transcription.",
-    "metadata": { "category": "models", "topic": "stt" }
+    "id": "med-vitamin-d",
+    "text": "Vitamin D 800 IU. One capsule daily with any meal. Recommended year round.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "drug": "vitamin d", "dose": "800 IU"}
   },
   {
-    "id": "kb-tts-choice",
-    "text": "Q: How is text-to-speech (TTS) configured in this starter? A: TTS is provided through LiveKit Inference, so no provider key is needed in the agent. The starter uses inference.TTS(model='cartesia/sonic-3', voice='<voice-id>'). To change the agent's voice, pick a different voice id for the same model, or switch to another Inference TTS model; the rest of the AgentSession wiring stays the same.",
-    "metadata": { "category": "models", "topic": "tts" }
+    "id": "med-paracetamol-prn",
+    "text": "Paracetamol 500mg may be taken as needed for knee pain, up to two tablets at a time and no more than eight tablets in twenty four hours. Leave at least four hours between doses.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "drug": "paracetamol", "dose": "500mg"}
   },
   {
-    "id": "kb-llm-inference",
-    "text": "Q: How is the LLM wired up without provider API keys? A: LiveKit Inference proxies the model call, so you reference a model by name instead of holding an OpenAI/Anthropic key in the agent. This starter uses inference.LLM(model='openai/gpt-5.2-chat-latest'). Only LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET are required for STT, LLM, and TTS to work through Inference.",
-    "metadata": { "category": "models", "topic": "llm" }
+    "id": "med-schedule-morning",
+    "text": "Morning medicines, taken before or with breakfast: lisinopril 10mg and metformin 500mg. The blue pill organiser on the kitchen windowsill holds the morning doses.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "time_of_day": "morning"}
   },
   {
-    "id": "kb-preemptive-generation",
-    "text": "Q: What is preemptive (speculative) speech generation and what is its trade-off? A: With preemptive_generation=True the agent speculatively starts generating (and can run TTS) on the LLM response before the user's turn is fully finalized, reducing perceived latency. The trade-off is wasted compute and higher LLM token usage: if the chat context or tools change in the on_user_turn_completed node — for example after a RAG injection — the speculative response is discarded and regenerated.",
-    "metadata": { "category": "voice-agents", "topic": "latency" }
+    "id": "med-schedule-evening",
+    "text": "Evening medicines: metformin 500mg with the evening meal, then atorvastatin 20mg at bedtime. The green organiser holds the evening doses.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medication", "time_of_day": "evening"}
   },
   {
-    "id": "kb-noise-cancellation",
-    "text": "Q: How does this starter improve audio quality in noisy environments? A: It applies noise cancellation on the input audio using the ai_coustics plug-in, configured through room_io.AudioInputOptions when the AgentSession's room input is set up. Cleaning the user's audio before STT improves transcription accuracy and turn detection, especially on calls or in noisy rooms.",
-    "metadata": { "category": "voice-agents", "topic": "audio" }
+    "id": "allergy-penicillin",
+    "text": "Serious allergy to penicillin. Causes a severe rash and swelling. This must be mentioned at every medical or dental appointment. It is recorded on the GP file and on the bracelet worn on the left wrist.",
+    "metadata": {"doc_type": "source_of_truth", "category": "allergy", "severity": "severe"}
   },
   {
-    "id": "kb-metrics-usage",
-    "text": "Q: How do I collect cost and usage metrics from an agent session? A: For session-scoped cost and usage tracking, use the session usage surface to aggregate per-model usage across the conversation and export a summary when the session ends. For finer granularity, subscribe to the per-plugin metrics_collected event on each component (STT, LLM, TTS, VAD). Note the older session-level metrics_collected event (session.on('metrics_collected', ...)) is deprecated in favor of the per-plugin event and session usage.",
-    "metadata": { "category": "deployment", "topic": "telemetry" }
+    "id": "allergy-shellfish",
+    "text": "Mild allergy to shellfish. Causes an itchy rash but no breathing difficulty. Avoid prawns, crab and mussels.",
+    "metadata": {"doc_type": "source_of_truth", "category": "allergy", "severity": "mild"}
   },
   {
-    "id": "kb-agentserver-pattern",
-    "text": "Q: How is the agent process structured in this starter? A: It uses the AgentServer pattern from livekit.agents rather than WorkerOptions/entrypoint. You create server = AgentServer(), assign server.setup_fnc = prewarm to load Silero VAD into proc.userdata['vad'], and decorate the session handler with @server.rtc_session(agent_name='agent-py') on an async function that takes a JobContext. The process runs via cli.run_app(server) under if __name__ == '__main__'.",
-    "metadata": { "category": "voice-agents", "topic": "architecture" }
+    "id": "alert-falls",
+    "text": "History of two falls in the past year, both in the bathroom. Grab rails were fitted in March. Always use the walking stick on stairs and outdoors.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medical_alert"}
   },
   {
-    "id": "kb-explicit-dispatch",
-    "text": "Q: How do I make the frontend dispatch to this specific Python agent? A: The agent registers under agent_name='agent-py' in its @server.rtc_session decorator. For explicit dispatch, the frontend must request that same name: set AGENT_NAME=agent-py in the frontend's .env.local, which flows into app-config.ts (agentName) and the room configuration's agents list. If AGENT_NAME is left blank, the room uses automatic dispatch instead.",
-    "metadata": { "category": "deployment", "topic": "dispatch" }
+    "id": "alert-hearing",
+    "text": "Moderate hearing loss in the right ear. Hearing aid is worn in the left ear only. Speak clearly and from the left side. Batteries are changed on the first Sunday of the month.",
+    "metadata": {"doc_type": "source_of_truth", "category": "medical_alert"}
   },
   {
-    "id": "kb-prewarm-vad",
-    "text": "Q: Why and how is Silero VAD prewarmed? A: Loading the VAD model is relatively expensive, so it is loaded once at process startup instead of per session. The starter sets server.setup_fnc = prewarm, and prewarm loads silero.VAD into proc.userdata['vad']; each new session then reuses that cached VAD instance, reducing first-response latency for the very first call the worker handles.",
-    "metadata": { "category": "voice-agents", "topic": "performance" }
+    "id": "appt-cardiology",
+    "text": "Cardiology appointment with Dr. Patel on Tuesday the fifteenth of September at two thirty in the afternoon, at Riverside Clinic, second floor. Sarah is driving and will arrive at one forty five.",
+    "metadata": {"doc_type": "source_of_truth", "category": "appointment", "date": "2026-09-15", "time": "14:30"}
+  },
+  {
+    "id": "appt-gp-review",
+    "text": "GP medication review with Dr. Okafor on Thursday the twenty fourth of September at ten fifteen in the morning at Hollybank Surgery. Bring all current pill boxes to the appointment.",
+    "metadata": {"doc_type": "source_of_truth", "category": "appointment", "date": "2026-09-24", "time": "10:15"}
+  },
+  {
+    "id": "appt-dentist",
+    "text": "Dental check up on Monday the fifth of October at eleven in the morning with Mr. Reeves. Remember to mention the penicillin allergy.",
+    "metadata": {"doc_type": "source_of_truth", "category": "appointment", "date": "2026-10-05", "time": "11:00"}
+  },
+  {
+    "id": "appt-bloods",
+    "text": "Blood test at Hollybank Surgery on Wednesday the seventh of October at eight forty in the morning. Fasting is required, so no breakfast beforehand, but water and morning medicines are fine.",
+    "metadata": {"doc_type": "source_of_truth", "category": "appointment", "date": "2026-10-07", "time": "08:40"}
+  },
+  {
+    "id": "appt-physio",
+    "text": "Physiotherapy for the left knee, every second Friday at nine thirty in the morning at Riverside Clinic. The next session is Friday the eighteenth of September.",
+    "metadata": {"doc_type": "source_of_truth", "category": "appointment", "date": "2026-09-18", "time": "09:30"}
+  },
+  {
+    "id": "appt-chiropody",
+    "text": "Chiropody visit at home on the last Wednesday of each month at two in the afternoon. Margaret comes to the house, so no travel is needed.",
+    "metadata": {"doc_type": "source_of_truth", "category": "appointment"}
+  },
+  {
+    "id": "contact-sarah",
+    "text": "Sarah is the daughter and the main emergency contact. Her mobile number is 07700 900 118. She lives twenty minutes away in Ashford and visits on Sundays.",
+    "metadata": {"doc_type": "source_of_truth", "category": "contact", "relation": "daughter"}
+  },
+  {
+    "id": "contact-michael",
+    "text": "Michael is the son. He lives in Manchester and telephones on Wednesday evenings. His mobile number is 07700 900 224.",
+    "metadata": {"doc_type": "source_of_truth", "category": "contact", "relation": "son"}
+  },
+  {
+    "id": "contact-gp",
+    "text": "Hollybank Surgery is the GP practice. The telephone number is 01233 555 040. Dr. Okafor is the named doctor. The surgery is open from eight in the morning until six in the evening on weekdays.",
+    "metadata": {"doc_type": "source_of_truth", "category": "contact", "relation": "gp"}
+  },
+  {
+    "id": "contact-neighbour",
+    "text": "Joan next door at number fourteen has a spare key and can help in an emergency. Her number is 01233 555 761. She is usually at home in the mornings.",
+    "metadata": {"doc_type": "source_of_truth", "category": "contact", "relation": "neighbour"}
+  },
+  {
+    "id": "life-name",
+    "text": "His name is William Hartley, but everyone calls him Bill. He dislikes being called William, which he says sounds like he is in trouble.",
+    "metadata": {"doc_type": "life_context", "category": "identity"}
+  },
+  {
+    "id": "life-late-wife",
+    "text": "His wife Margaret died three years ago in April. They were married for fifty one years. He likes talking about her, particularly about their garden and their holidays in Whitby.",
+    "metadata": {"doc_type": "life_context", "category": "family"}
+  },
+  {
+    "id": "life-grandchildren",
+    "text": "He has three grandchildren. Ellie is nineteen and studying veterinary science in Bristol. Tom is fifteen and plays cricket. Amara is seven and is learning the recorder, loudly.",
+    "metadata": {"doc_type": "life_context", "category": "family"}
+  },
+  {
+    "id": "life-career",
+    "text": "He worked for thirty eight years as a railway signalman, mostly on the Kent coast line. He is proud of it and enjoys explaining how signal boxes worked.",
+    "metadata": {"doc_type": "life_context", "category": "history"}
+  },
+  {
+    "id": "life-garden",
+    "text": "The garden matters a great deal to him. He grows tomatoes, runner beans and dahlias. The dahlias were Margaret's favourite. He walks out to look at them after breakfast most mornings.",
+    "metadata": {"doc_type": "life_context", "category": "interests"}
+  },
+  {
+    "id": "life-cricket",
+    "text": "He follows cricket closely and supports Kent. He listens to Test Match Special on the radio and will happily talk about it for as long as anyone lets him.",
+    "metadata": {"doc_type": "life_context", "category": "interests"}
+  },
+  {
+    "id": "life-routine-morning",
+    "text": "He wakes around half past six, has tea and toast, takes his morning medicines, then walks around the garden. He listens to the radio news at eight.",
+    "metadata": {"doc_type": "life_context", "category": "routine", "time_of_day": "morning"}
+  },
+  {
+    "id": "life-routine-evening",
+    "text": "He has his evening meal around six, watches the news, then reads or listens to the radio. He goes to bed around ten, after his bedtime tablet.",
+    "metadata": {"doc_type": "life_context", "category": "routine", "time_of_day": "evening"}
+  },
+  {
+    "id": "life-sunday",
+    "text": "Sarah visits most Sundays, usually early afternoon, and often brings Amara. They have tea together and sometimes drive to the coast if the weather is good.",
+    "metadata": {"doc_type": "life_context", "category": "routine"}
+  },
+  {
+    "id": "life-preferences",
+    "text": "He prefers tea to coffee, strong with a little milk. He does not like being fussed over or spoken to slowly. He would rather be asked than told.",
+    "metadata": {"doc_type": "life_context", "category": "preferences"}
+  },
+  {
+    "id": "life-technology",
+    "text": "He is comfortable with the radio and the television but finds smartphones frustrating. He would rather speak to someone than type. He does not use email.",
+    "metadata": {"doc_type": "life_context", "category": "preferences"}
+  },
+  {
+    "id": "care-mobility",
+    "text": "He walks well indoors but uses a stick outdoors and on stairs. He can manage the stairs alone but prefers company. He should not carry anything heavy up or down.",
+    "metadata": {"doc_type": "source_of_truth", "category": "care_plan"}
+  },
+  {
+    "id": "care-meals",
+    "text": "He makes his own breakfast and lunch. A hot meal is delivered on weekdays at around midday. Sarah cooks on Sundays. He should eat before taking metformin.",
+    "metadata": {"doc_type": "source_of_truth", "category": "care_plan"}
+  },
+  {
+    "id": "care-emergency",
+    "text": "In an emergency, call 999 first, then Sarah on 07700 900 118. The pendant alarm is worn during the day and sits on the bedside table at night. Press and hold the button for three seconds.",
+    "metadata": {"doc_type": "source_of_truth", "category": "care_plan"}
+  },
+  {
+    "id": "care-what-to-escalate",
+    "text": "Sarah should be told the same day about any fall, any chest pain, any new confusion, or if medicines are missed for more than one day. Routine matters can wait for the Sunday visit.",
+    "metadata": {"doc_type": "source_of_truth", "category": "care_plan"}
   }
 ]

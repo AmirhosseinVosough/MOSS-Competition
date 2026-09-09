@@ -62,7 +62,7 @@ async def test_grounding() -> None:
             Assistant,
             {
                 "recall_facts": lambda: "I don't have anything remembered for you yet.",
-                "search_knowledge": lambda: "No relevant documentation was found.",
+                "search_care_notes": lambda: "No relevant documentation was found.",
             },
         ):
             # Run an agent turn following the user's request for information about their birth city (not known by the agent)
