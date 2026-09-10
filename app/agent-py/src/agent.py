@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import textwrap
 import time
 import uuid
@@ -21,6 +22,8 @@ from livekit.agents import (
     inference,
     room_io,
 )
+from livekit.agents import stt as stt_module
+from livekit.agents.inference.stt import DeepgramOptions
 from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from moss import DocumentInfo, MossClient, QueryOptions
@@ -83,6 +86,66 @@ SWEEPABLE_CATEGORIES = ("allergy", "medication", "appointment", "contact", "medi
 # Measured on the 41-document care index: pure semantic beat every hybrid setting
 # (6/6 correct vs 5/6), and keyword-leaning pulled in unrelated documents.
 SEARCH_ALPHA = 1.0
+
+# A partial shorter than this carries no searchable content -- the first interim
+# of an utterance routinely arrives empty or one word long.
+SPECULATIVE_MIN_CHARS = 10
+# Interims measured ~1030ms apart, so this rarely binds; it exists so a chattier
+# STT model cannot flood the retrieval path.
+SPECULATIVE_MIN_GAP_MS = 350
+
+# ---------------------------------------------------------------------------
+# Grounding gate
+#
+# The agent must never speak a dose, a time or a phone number that is not in
+# Bill's notes. Checking every sentence before it is spoken costs one retrieval
+# per sentence -- affordable only because retrieval is ~5ms. At a hosted vector
+# database's 200-500ms this would add seconds to every reply.
+#
+# The check is deliberately narrow. Only sentences carrying a specific factual
+# claim are verified; conversation passes untouched. An over-eager gate that
+# hedges ordinary speech would make the agent useless, which is a worse failure
+# than the one it is guarding against.
+# ---------------------------------------------------------------------------
+
+# Spoken numbers, because the agent is instructed to say "five hundred" rather
+# than "500". Ordinals are included because dates are spoken as "the fifteenth".
+# These are parsed as phrases, not as separate words: "five hundred" is 500, and
+# reading it as {5, 100} once caused the gate to reject a correct dose.
+_NUMBER_UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+    # Ordinals, for spoken dates.
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
+    "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18,
+    "nineteenth": 19, "twentieth": 20, "thirtieth": 30,
+}
+_NUMBER_SCALES = {"hundred": 100, "thousand": 1000}
+
+# A sentence is only worth checking if it asserts something specific.
+_CLAIM_HINTS = (
+    "mg", "milligram", "microgram", "tablet", "capsule", "dose", "doses",
+    "pill", "pills", "take", "takes", "taking", "appointment", "allergic",
+    "allergy", "o'clock", "am", "pm", "morning", "afternoon", "evening",
+    "bedtime", "daily", "twice", "once", "number", "call",
+)
+
+# How long the gate may spend verifying one sentence before giving up and
+# letting it through. Retrieval measures ~5ms; this is a hang guard, not a
+# budget.
+GATE_TIMEOUT_S = 0.5
+
+# Said instead of an unsupported claim.
+GATE_HEDGE = (
+    "I am not certain about that one, so I would rather not say. "
+    "It is worth checking with Sarah."
+)
 
 
 class Assistant(Agent):
@@ -166,6 +229,15 @@ class Assistant(Agent):
         # Falls back to the cloud path if the session cannot be created.
         self._memory_session = None
         self._memory_dirty = False
+        # Notes retrieved while the user was still speaking, used by
+        # on_user_turn_completed. Sequence numbers guard against a slow search on
+        # an early, shorter partial landing after a later, better one.
+        self._spec_notes: list[str] = []
+        self._spec_seq = 0
+        self._spec_best_seq = -1
+        self._spec_last_text = ""
+        self._spec_last_at = 0.0
+        self._spec_tasks: set = set()
 
     async def on_enter(self) -> None:
         # Preload the knowledge index and open a writable session over memory so
@@ -199,6 +271,368 @@ class Assistant(Agent):
                     await self._moss.load_index(MEMORY_INDEX)
                 except Exception:
                     logger.exception("Failed to load memory index for fallback reads")
+
+    def _reset_turn_notes(self) -> None:
+        """Drop anything gathered for the previous turn.
+
+        Without this the previous question's notes would still be in the buffer
+        when the next one is answered -- a correctness bug, not untidiness.
+        """
+        self._spec_notes = []
+        self._spec_best_seq = -1
+        self._spec_last_text = ""
+        self._spec_last_at = 0.0
+
+    async def _speculative_search(self, text: str, seq: int) -> None:
+        """Search on a partial transcript. Never awaited by the audio path."""
+        try:
+            result = await self._moss.query(
+                KNOWLEDGE_INDEX, text, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
+            )
+            # A search started earlier can finish later. Only a newer sequence
+            # number may replace the buffer.
+            if seq < self._spec_best_seq:
+                return
+            self._spec_best_seq = seq
+            self._spec_notes = [
+                (getattr(d, "text", "") or "").strip()
+                for d in (getattr(result, "docs", None) or [])
+            ]
+            self._spec_notes = [n for n in self._spec_notes if n]
+            logger.info(
+                "speculative search #%d buffered %d note(s) for %r",
+                seq,
+                len(self._spec_notes),
+                text[:45],
+            )
+            await self._publish_moss_context(f"(mid-sentence) {text}", result)
+        except Exception:
+            # Speculative retrieval is an optimisation; its failure must never
+            # surface to the caller or the audio pipeline.
+            logger.exception("speculative search failed for %r", text[:40])
+
+    def _maybe_speculate(self, text: str) -> None:
+        """Fire a search on a partial if it is worth one. Returns immediately."""
+        now = time.perf_counter()
+        if len(text) < SPECULATIVE_MIN_CHARS:
+            return
+        if text == self._spec_last_text:
+            return
+        if (now - self._spec_last_at) * 1000 < SPECULATIVE_MIN_GAP_MS:
+            return
+        if self._moss is None:
+            return
+
+        self._spec_last_text = text
+        self._spec_last_at = now
+        self._spec_seq += 1
+        # create_task, not await: blocking here would stall transcription.
+        task = asyncio.create_task(self._speculative_search(text, self._spec_seq))
+        self._spec_tasks.add(task)
+        task.add_done_callback(self._spec_tasks.discard)
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Put the relevant care notes in front of the LLM with the question.
+
+        This is the change that actually pays. Without it the LLM has to notice it
+        needs a fact, call a tool, wait, then think again -- two round trips. With
+        the notes already in context it answers in one. The tools remain for
+        follow-ups the injected notes do not cover.
+
+        Uses notes gathered while the user was speaking when there are any;
+        otherwise searches now, which at ~5ms is still far cheaper than the round
+        trip it removes.
+        """
+        try:
+            text = ""
+            content = getattr(new_message, "text_content", None) or getattr(
+                new_message, "content", None
+            )
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(c for c in content if isinstance(c, str))
+            text = (text or "").strip()
+            if not text:
+                return
+
+            notes, source = self._spec_notes, "while speaking"
+            if not notes:
+                result = await self._moss.query(
+                    KNOWLEDGE_INDEX, text, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
+                )
+                notes = [
+                    (getattr(d, "text", "") or "").strip()
+                    for d in (getattr(result, "docs", None) or [])
+                ]
+                notes = [n for n in notes if n]
+                source = "at turn end"
+                await self._publish_moss_context(text, result)
+
+            if notes:
+                turn_ctx.add_message(
+                    role="system",
+                    content=(
+                        "Notes from Bill's care records that may be relevant to what "
+                        "he just said. Use them if they answer his question. If they "
+                        "do not, look further before answering:\n\n"
+                        + "\n".join(f"- {n}" for n in notes)
+                    ),
+                )
+                logger.info(
+                    "injected %d note(s) retrieved %s for %r",
+                    len(notes),
+                    source,
+                    text[:50],
+                )
+        except Exception:
+            # Falling back to the tool path is slower but still correct.
+            logger.exception("context injection failed; tools remain available")
+        finally:
+            self._reset_turn_notes()
+
+    async def stt_node(self, audio, model_settings):
+        """Wrap the default speech-to-text node to watch partial transcripts.
+
+        Speech-to-text emits INTERIM_TRANSCRIPT events as the user is still
+        speaking -- "what", "what pills", "what pills do I take". The default
+        pipeline ignores them and acts only on the final one. Retrieval is cheap
+        enough (about 5ms) to run against every partial instead, so the notes are
+        already assembled by the time the user stops talking.
+
+        Each partial long enough to be worth one triggers a search whose result
+        is buffered for on_user_turn_completed. Timings are logged alongside so
+        the cadence stays visible. Every event is passed through untouched.
+        """
+        turn_started = time.perf_counter()
+        last_at = turn_started
+        last_text = ""
+        seen = 0
+
+        async for event in Agent.default.stt_node(self, audio, model_settings):
+            # Everything this node does beyond passing the event on is
+            # observation. It sits between the microphone and the rest of the
+            # pipeline, so a failure here would stop transcription entirely and
+            # the agent would simply go deaf. Swallow anything our own code
+            # raises, and yield the event regardless.
+            try:
+                etype = getattr(event, "type", None)
+
+                if etype == stt_module.SpeechEventType.INTERIM_TRANSCRIPT:
+                    alts = getattr(event, "alternatives", None) or []
+                    text = (alts[0].text if alts else "") or ""
+                    now = time.perf_counter()
+                    seen += 1
+                    logger.info(
+                        "PARTIAL #%d  +%.0fms since last  %.0fms into turn  "
+                        "chars=%d (+%d)  %r",
+                        seen,
+                        (now - last_at) * 1000,
+                        (now - turn_started) * 1000,
+                        len(text),
+                        len(text) - len(last_text),
+                        text[-60:],
+                    )
+                    last_at, last_text = now, text
+                    self._maybe_speculate(text)
+
+                elif etype == stt_module.SpeechEventType.PREFLIGHT_TRANSCRIPT:
+                    alts = getattr(event, "alternatives", None) or []
+                    text = (alts[0].text if alts else "") or ""
+                    now = time.perf_counter()
+                    seen += 1
+                    logger.info(
+                        "PREFLIGHT #%d  +%.0fms since last  %.0fms into turn  "
+                        "chars=%d (+%d)  %r",
+                        seen,
+                        (now - last_at) * 1000,
+                        (now - turn_started) * 1000,
+                        len(text),
+                        len(text) - len(last_text),
+                        text[-60:],
+                    )
+                    last_at, last_text = now, text
+                    self._maybe_speculate(text)
+
+                elif etype == stt_module.SpeechEventType.FINAL_TRANSCRIPT:
+                    alts = getattr(event, "alternatives", None) or []
+                    text = (alts[0].text if alts else "") or ""
+                    logger.info(
+                        "FINAL after %d partials, %.0fms into turn: %r",
+                        seen,
+                        (time.perf_counter() - turn_started) * 1000,
+                        text,
+                    )
+                    turn_started = time.perf_counter()
+                    last_at, last_text, seen = turn_started, "", 0
+
+                elif etype == stt_module.SpeechEventType.START_OF_SPEECH:
+                    turn_started = last_at = time.perf_counter()
+                    last_text, seen = "", 0
+                    # Deliberately NOT clearing the speculative notes here.
+                    # Voice activity detection fires constantly on silence and on
+                    # the agent's own speech -- most of these events are followed
+                    # by an empty transcript. Clearing on each one wiped the notes
+                    # gathered mid-sentence before on_user_turn_completed could use
+                    # them, so every injection fell back to a turn-end search.
+                    # on_user_turn_completed clears in its `finally`, which is the
+                    # only point a turn is genuinely over.
+                    logger.info("--- START OF SPEECH ---")
+
+            except Exception:
+                logger.exception("stt_node observer failed; passing event through")
+
+            yield event
+
+    @staticmethod
+    def _numbers_in(text: str) -> set:
+        """Every number in a piece of text, as digit strings.
+
+        Handles digits ("500mg") and spoken phrases ("five hundred", "twenty
+        two", "the fifteenth"). Phrases are accumulated rather than read word by
+        word: "five hundred" is 500, not 5 and 100.
+        """
+        low = text.lower()
+        found = set(re.findall(r"\d+", low))
+
+        total = 0     # completed hundreds/thousands within the current phrase
+        current = 0   # the part being accumulated
+        seen = False
+
+        def flush():
+            nonlocal total, current, seen
+            if seen:
+                value = total + current
+                if value:
+                    found.add(str(value))
+            total, current, seen = 0, 0, False
+
+        for word in re.findall(r"[a-z]+", low):
+            if word in _NUMBER_UNITS:
+                current += _NUMBER_UNITS[word]
+                seen = True
+            elif word in _NUMBER_SCALES:
+                scale = _NUMBER_SCALES[word]
+                # "five hundred" -> 500; a bare "hundred" -> 100.
+                current = (current or 1) * scale
+                if scale >= 1000:
+                    total += current
+                    current = 0
+                seen = True
+            elif word == "and" and seen:
+                # "one hundred and twenty" keeps going.
+                continue
+            else:
+                flush()
+        flush()
+        return found
+
+    @staticmethod
+    def _is_checkable(sentence: str) -> bool:
+        """True if the sentence asserts something specific enough to verify.
+
+        Narrow on purpose: a gate that hedges ordinary conversation is worse than
+        no gate at all.
+        """
+        low = sentence.lower()
+        if not any(h in low for h in _CLAIM_HINTS):
+            return False
+        # A claim worth checking names a number -- a dose, a time, a date, a
+        # phone number. Advice without one has nothing to get factually wrong.
+        return bool(Assistant._numbers_in(sentence))
+
+    async def _is_supported(self, sentence: str) -> bool:
+        """Is every number in this sentence present in Bill's source records?
+
+        Deliberately not a similarity threshold. Similarity cannot tell 500mg
+        from 1000mg -- they are near-identical as text and opposite as facts.
+        Comparing the numbers themselves can.
+        """
+        result = await self._moss.query(
+            KNOWLEDGE_INDEX,
+            sentence,
+            QueryOptions(
+                top_k=5,
+                alpha=SEARCH_ALPHA,
+                filter={
+                    "field": "doc_type",
+                    "condition": {"$eq": "source_of_truth"},
+                },
+            ),
+        )
+        evidence = " ".join(
+            (getattr(d, "text", "") or "") for d in (getattr(result, "docs", None) or [])
+        )
+        if not evidence.strip():
+            return False
+        supported = self._numbers_in(evidence)
+        claimed = self._numbers_in(sentence)
+        return claimed.issubset(supported)
+
+    async def _gate(self, text_stream):
+        """Yield the agent's words, holding back unsupported factual claims.
+
+        Fails open throughout: any error here lets the sentence through. A silent
+        assistant is a worse outcome than an unverified sentence, and the model is
+        already instructed to ground its answers.
+        """
+        buffer = ""
+        async for chunk in text_stream:
+            buffer += chunk
+            # Emit sentence by sentence so a claim is checked before it is heard.
+            while True:
+                match = re.search(r"[.!?]+[\s]", buffer)
+                if not match:
+                    break
+                sentence, buffer = buffer[: match.end()], buffer[match.end() :]
+                async for out in self._gate_one(sentence):
+                    yield out
+        if buffer.strip():
+            async for out in self._gate_one(buffer):
+                yield out
+
+    async def _gate_one(self, sentence: str):
+        """Check a single sentence and yield it, or a hedge in its place."""
+        try:
+            if self._moss is None or not self._is_checkable(sentence):
+                yield sentence
+                return
+
+            started = time.perf_counter()
+            supported = await asyncio.wait_for(
+                self._is_supported(sentence), timeout=GATE_TIMEOUT_S
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+
+            if supported:
+                logger.info("gate PASS %.1fms %r", elapsed_ms, sentence.strip()[:60])
+                yield sentence
+            else:
+                logger.warning(
+                    "gate BLOCK %.1fms unsupported claim: %r",
+                    elapsed_ms,
+                    sentence.strip()[:60],
+                )
+                yield GATE_HEDGE + " "
+        except TimeoutError:
+            logger.warning("gate timed out; letting sentence through")
+            yield sentence
+        except Exception:
+            logger.exception("gate failed; letting sentence through")
+            yield sentence
+
+    async def tts_node(self, text, model_settings):
+        """Speak the agent's reply, with the grounding gate in front of it.
+
+        This is the point where Moss's latency stops being a nicety. One
+        retrieval per spoken sentence is only affordable at single-digit
+        milliseconds; the same design against a hosted vector database would add
+        seconds to every reply.
+        """
+        async for frame in Agent.default.tts_node(
+            self, self._gate(text), model_settings
+        ):
+            yield frame
 
     async def on_exit(self) -> None:
         # Persist locally-written facts so they survive into the next session.
@@ -439,7 +873,25 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        # nova-3-medical over plain nova-3: this agent talks about drug names,
+        # and the general model mis-heard them ("Take any medication today",
+        # "allergic to vitamin" / "D?" split across two utterances). Mis-hearing a
+        # medicine matters more here than a few milliseconds of latency.
+        #
+        # interim_results is off by default; without it Deepgram emits only a
+        # final transcript. Measured with it on: interims arrive on a fixed
+        # ~1030ms tick against a median utterance of 526ms, so most questions end
+        # before the first useful one. Speculative search is therefore a bonus for
+        # long utterances, not the main mechanism -- see on_user_turn_completed.
+        #
+        # Deepgram Flux was trialled and dropped: its eager end-of-turn signal is
+        # promising but we could not get a session to connect, and nova-3 has a
+        # working track record here.
+        stt=inference.STT(
+            model="deepgram/nova-3-medical",
+            language="en",
+            extra_kwargs=DeepgramOptions(interim_results=True, no_delay=True),
+        ),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=inference.TTS(
@@ -449,9 +901,23 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
+        # Endpointing is left at its defaults deliberately.
+        #
+        # Bill pauses mid-sentence, and the agent splits his questions in two --
+        # "what medications should I" and "take in the morning with my breakfast"
+        # arrive as separate turns. Raising endpointing min_delay to 1.2s was
+        # tried and reverted: it did not merge the fragments (his pauses are
+        # longer than that) and it added roughly three seconds of silence before
+        # every reply, which is far more damaging than the fragmentation. One
+        # measured turn waited 3960ms after the speaker finished at ~845ms.
+        #
+        # The semantic turn detector (MultilingualModel, above) should be holding
+        # grammatically incomplete turns open on its own; understanding why it is
+        # not is the next thing to look at, rather than fighting it with timeouts.
+        #
+        # preemptive_generation moved in here from its own argument, which is
+        # deprecated in favour of turn_handling.
+        turn_handling={"preemptive_generation": {"enabled": True}},
     )
 
     # Start the session, which initializes the voice pipeline and warms up the models

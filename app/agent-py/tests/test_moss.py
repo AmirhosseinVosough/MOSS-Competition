@@ -11,6 +11,7 @@ Note the shape these tests assume: `Assistant` no longer builds its own
 rather than the cloud client.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -263,3 +264,317 @@ async def test_on_exit_pushes_only_when_there_is_something_to_push() -> None:
     await assistant.on_exit()
     assert assistant._memory_session.pushed == 1
     assert assistant._memory_dirty is False
+
+
+class _FakeTurnCtx:
+    """Stand-in for llm.ChatContext, recording what gets injected."""
+
+    def __init__(self) -> None:
+        self.added: list[tuple] = []
+
+    def add_message(self, role, content):
+        self.added.append((role, content))
+
+
+class _FakeMessage:
+    def __init__(self, text: str) -> None:
+        self.text_content = text
+
+
+async def test_turn_end_injects_notes_into_the_prompt() -> None:
+    """The notes reach the LLM with the question, not via a tool call."""
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    assistant._moss.query_result = _FakeSearchResult(
+        [_FakeDoc("Metformin 500mg twice daily."), _FakeDoc("Aspirin 75mg after lunch.")]
+    )
+    ctx = _FakeTurnCtx()
+
+    await assistant.on_user_turn_completed(ctx, _FakeMessage("what pills do I take"))
+
+    assert len(ctx.added) == 1
+    role, content = ctx.added[0]
+    assert role == "system"
+    assert "Metformin 500mg twice daily." in content
+    assert "Aspirin 75mg after lunch." in content
+
+
+async def test_turn_end_prefers_notes_gathered_while_speaking() -> None:
+    """If a partial already retrieved notes, do not search again at turn end."""
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    assistant._spec_notes = ["Cardiology appointment Tuesday at half past two."]
+    ctx = _FakeTurnCtx()
+
+    await assistant.on_user_turn_completed(ctx, _FakeMessage("when is my appointment"))
+
+    assert "Cardiology appointment" in ctx.added[0][1]
+    # No fresh query: the speculative result was reused.
+    assert assistant._moss.query_calls == []
+
+
+async def test_turn_notes_are_cleared_between_turns() -> None:
+    """One question's notes must not leak into the next answer."""
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    assistant._spec_notes = ["Something from the previous question."]
+
+    await assistant.on_user_turn_completed(_FakeTurnCtx(), _FakeMessage("anything"))
+
+    assert assistant._spec_notes == []
+    assert assistant._spec_best_seq == -1
+
+
+async def test_a_stale_speculative_result_cannot_overwrite_a_newer_one() -> None:
+    """A search on an earlier, shorter partial may finish last. It must lose."""
+    assistant = _wire(Assistant(room=_FakeRoom()))
+
+    assistant._moss.query_result = _FakeSearchResult([_FakeDoc("Newer, better notes.")])
+    await assistant._speculative_search("what pills do I take", seq=5)
+    assert assistant._spec_notes == ["Newer, better notes."]
+
+    # Sequence 2 started earlier but finishes now; it must be discarded.
+    assistant._moss.query_result = _FakeSearchResult([_FakeDoc("Older, vaguer notes.")])
+    await assistant._speculative_search("what pills", seq=2)
+    assert assistant._spec_notes == ["Newer, better notes."]
+
+
+async def test_speculation_skips_partials_that_are_too_short() -> None:
+    """The first interim of an utterance is routinely empty or one word."""
+    assistant = _wire(Assistant(room=_FakeRoom()))
+
+    assistant._maybe_speculate("what")
+    assert assistant._spec_tasks == set()
+
+    assistant._maybe_speculate("what pills do I take in the morning")
+    assert len(assistant._spec_tasks) == 1
+    for task in list(assistant._spec_tasks):
+        await task
+
+
+async def test_injection_failure_does_not_raise() -> None:
+    """If retrieval fails at turn end the agent still answers, using its tools."""
+    assistant = _wire(Assistant(room=_FakeRoom()))
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("index not loaded")
+
+    assistant._moss.query = boom
+    ctx = _FakeTurnCtx()
+
+    await assistant.on_user_turn_completed(ctx, _FakeMessage("what pills do I take"))
+
+    assert ctx.added == []
+    assert assistant._spec_notes == []
+
+
+class _FakeAlt:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FakeSpeechEvent:
+    def __init__(self, etype, text: str = "") -> None:
+        self.type = etype
+        self.alternatives = [_FakeAlt(text)]
+
+
+async def _drive_stt_node(assistant, events):
+    """Push fake speech events through stt_node, returning what came out."""
+    from livekit.agents import Agent
+
+    async def fake_default(_self, _audio, _settings):
+        for ev in events:
+            yield ev
+
+    original = Agent.default.stt_node
+    Agent.default.stt_node = fake_default
+    try:
+        return [ev async for ev in assistant.stt_node(None, None)]
+    finally:
+        Agent.default.stt_node = original
+
+
+async def test_stt_node_passes_every_event_through_and_speculates(monkeypatch) -> None:
+    """The hook must be transparent, and must actually call the search.
+
+    This exists because the speculative call was once defined but never wired in:
+    the edit that was meant to add it silently did not apply, and nothing failed.
+    """
+    from livekit.agents import stt as stt_module
+
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    fired: list[str] = []
+    monkeypatch.setattr(assistant, "_maybe_speculate", lambda text: fired.append(text))
+
+    events = [
+        _FakeSpeechEvent(stt_module.SpeechEventType.START_OF_SPEECH),
+        _FakeSpeechEvent(stt_module.SpeechEventType.INTERIM_TRANSCRIPT, "what pills do I take"),
+        _FakeSpeechEvent(stt_module.SpeechEventType.FINAL_TRANSCRIPT, "what pills do I take?"),
+    ]
+    out = await _drive_stt_node(assistant, events)
+
+    # Transparent: everything passed through, in order, unchanged.
+    assert out == events
+    # And the partial actually reached the speculative path.
+    assert fired == ["what pills do I take"]
+
+
+async def test_stt_node_keeps_streaming_when_our_own_code_raises(monkeypatch) -> None:
+    """A failure in the observer must not stop transcription."""
+    from livekit.agents import stt as stt_module
+
+    assistant = _wire(Assistant(room=_FakeRoom()))
+
+    def boom(_text):
+        raise RuntimeError("index not loaded")
+
+    monkeypatch.setattr(assistant, "_maybe_speculate", boom)
+
+    events = [
+        _FakeSpeechEvent(stt_module.SpeechEventType.INTERIM_TRANSCRIPT, "what pills do I take"),
+        _FakeSpeechEvent(stt_module.SpeechEventType.FINAL_TRANSCRIPT, "what pills do I take?"),
+    ]
+    out = await _drive_stt_node(assistant, events)
+
+    # The agent stays hearing even though the observer blew up on every event.
+    assert out == events
+
+
+async def test_speech_start_does_not_discard_notes_gathered_mid_sentence() -> None:
+    """Voice detection fires constantly; it must not wipe the buffer.
+
+    Regression: clearing on START_OF_SPEECH threw away notes retrieved while the
+    user was speaking, so every injection fell back to a turn-end search.
+    """
+    from livekit.agents import stt as stt_module
+
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    assistant._spec_notes = ["Metformin 500mg twice daily."]
+
+    await _drive_stt_node(
+        assistant, [_FakeSpeechEvent(stt_module.SpeechEventType.START_OF_SPEECH)]
+    )
+
+    assert assistant._spec_notes == ["Metformin 500mg twice daily."]
+
+
+# --------------------------------------------------------------------------
+# Grounding gate
+# --------------------------------------------------------------------------
+
+
+async def _collect(agen):
+    return [chunk async for chunk in agen]
+
+
+async def _stream(*chunks):
+    for c in chunks:
+        yield c
+
+
+def test_numbers_are_read_as_phrases_not_words() -> None:
+    """"five hundred" is 500, not 5 and 100.
+
+    Regression: reading number words individually made the gate reject a correct
+    500mg dose, because the notes contain 500 and never 5 or 100. A gate that
+    blocks correct information is worse than no gate.
+    """
+    n = Assistant._numbers_in
+    assert n("five hundred milligrams") == {"500"}
+    assert n("one thousand milligrams") == {"1000"}
+    assert n("twenty two") == {"22"}
+    assert n("seventy five") == {"75"}
+    assert n("500mg") == {"500"}
+    # Ordinals, because dates are spoken as "the fifteenth".
+    assert n("the fifteenth") == {"15"}
+
+
+def test_only_specific_claims_are_checked() -> None:
+    """Ordinary conversation must pass without a lookup."""
+    checkable = Assistant._is_checkable
+    assert checkable("You take metformin, five hundred milligrams, twice daily.")
+    assert checkable("Your appointment is on the fifteenth.")
+    # No number to be wrong about.
+    assert not checkable("You are allergic to penicillin.")
+    assert not checkable("Good morning Bill, how did you sleep?")
+    assert not checkable("The dahlias are looking lovely today.")
+
+
+async def test_gate_speaks_a_supported_claim() -> None:
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    assistant._moss.query_result = _FakeSearchResult(
+        [_FakeDoc("Metformin 500mg. Take one tablet twice daily.")]
+    )
+    out = await _collect(
+        assistant._gate(_stream("You take metformin, five hundred milligrams. "))
+    )
+    assert "five hundred milligrams" in "".join(out)
+
+
+async def test_gate_replaces_an_unsupported_claim_with_a_hedge() -> None:
+    """The wrong dose must not reach the speaker."""
+    from agent import GATE_HEDGE
+
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    assistant._moss.query_result = _FakeSearchResult(
+        [_FakeDoc("Metformin 500mg. Take one tablet twice daily.")]
+    )
+    spoken = "".join(
+        await _collect(
+            assistant._gate(_stream("You take metformin, one thousand milligrams. "))
+        )
+    )
+    assert "one thousand" not in spoken
+    assert GATE_HEDGE.split(".")[0] in spoken
+
+
+async def test_gate_leaves_ordinary_conversation_alone() -> None:
+    """No claim, no lookup, no interference."""
+    assistant = _wire(Assistant(room=_FakeRoom()))
+    spoken = "".join(
+        await _collect(assistant._gate(_stream("Good morning Bill. ", "How did you sleep? ")))
+    )
+    assert spoken == "Good morning Bill. How did you sleep? "
+    assert assistant._moss.query_calls == []
+
+
+async def test_gate_fails_open_when_retrieval_breaks() -> None:
+    """A broken gate must not silence the agent.
+
+    Staying quiet is a worse failure than speaking an unverified sentence: the
+    model is already instructed to ground its answers, and a mute assistant is
+    no use to anyone.
+    """
+    assistant = _wire(Assistant(room=_FakeRoom()))
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("index not loaded")
+
+    assistant._moss.query = boom
+    spoken = "".join(
+        await _collect(
+            assistant._gate(_stream("You take metformin, five hundred milligrams. "))
+        )
+    )
+    assert "five hundred milligrams" in spoken
+
+
+async def test_gate_fails_open_when_retrieval_hangs() -> None:
+    """A hung lookup must not stop the agent speaking either."""
+    import agent as agent_module
+
+    assistant = _wire(Assistant(room=_FakeRoom()))
+
+    async def hang(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    assistant._moss.query = hang
+    original = agent_module.GATE_TIMEOUT_S
+    agent_module.GATE_TIMEOUT_S = 0.05
+    try:
+        spoken = "".join(
+            await _collect(
+                assistant._gate(_stream("You take metformin, five hundred milligrams. "))
+            )
+        )
+    finally:
+        agent_module.GATE_TIMEOUT_S = original
+    assert "five hundred milligrams" in spoken

@@ -52,10 +52,20 @@ export async function POST(req: Request) {
       userId = randomUUID();
     }
 
-    // Parse room config from request body.
-    const body = await req.json();
-    const roomConfig = body?.room_config
-      ? RoomConfiguration.fromJson(body.room_config, { ignoreUnknownFields: true })
+    // Parse room config from request body. The client sometimes POSTs with no
+    // body at all; req.json() throws on empty input, which used to fail the whole
+    // request with a 500 and leave the browser unable to connect.
+    let body: unknown = undefined;
+    try {
+      body = await req.json();
+    } catch {
+      body = undefined;
+    }
+    const roomConfig = (body as { room_config?: unknown } | undefined)?.room_config
+      ? RoomConfiguration.fromJson(
+          (body as { room_config: object }).room_config,
+          { ignoreUnknownFields: true }
+        )
       : new RoomConfiguration();
 
     // Stamp `{ "user_id": <uuid> }` as the agent dispatch metadata. The agent reads this via
