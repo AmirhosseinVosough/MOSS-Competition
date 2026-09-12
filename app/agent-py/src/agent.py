@@ -383,9 +383,11 @@ class Assistant(Agent):
     async def _speculative_search(self, text: str, seq: int) -> None:
         """Search on a partial transcript. Never awaited by the audio path."""
         try:
+            started = time.perf_counter()
             result = await self._moss.query(
                 KNOWLEDGE_INDEX, text, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
             )
+            elapsed_ms = (time.perf_counter() - started) * 1000
             # A search started earlier can finish later. Only a newer sequence
             # number may replace the buffer.
             if seq < self._spec_best_seq:
@@ -402,7 +404,9 @@ class Assistant(Agent):
                 len(self._spec_notes),
                 text[:45],
             )
-            await self._publish_moss_context(f"(mid-sentence) {text}", result)
+            await self._publish_moss_context(
+                f"(mid-sentence) {text}", result, elapsed_ms
+            )
         except Exception:
             # Speculative retrieval is an optimisation; its failure must never
             # surface to the caller or the audio pipeline.
@@ -688,6 +692,30 @@ class Assistant(Agent):
             async for out in self._gate_one(buffer):
                 yield out
 
+    async def _publish_gate_event(self, sentence: str, verdict: str, ms: float) -> None:
+        """Tell the frontend a sentence was checked before it was spoken.
+
+        Retrieval is already visible in the panel; verification was not, and it
+        is the part that only works because a lookup costs milliseconds.
+        """
+        if self._room is None:
+            return
+        try:
+            payload = {
+                "type": "moss_gate",
+                "data": {
+                    "sentence": sentence.strip()[:160],
+                    "verdict": verdict,  # pass | block | skip | timeout
+                    "time_taken_ms": round(ms, 2),
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                },
+            }
+            await self._room.local_participant.publish_data(
+                payload=json.dumps(payload, default=str).encode("utf-8"), reliable=True
+            )
+        except Exception:
+            logger.exception("failed to publish moss_gate event")
+
     async def _gate_one(self, sentence: str):
         """Check a single sentence and yield it, or a hedge in its place."""
         try:
@@ -703,6 +731,7 @@ class Assistant(Agent):
 
             if supported:
                 logger.info("gate PASS %.1fms %r", elapsed_ms, sentence.strip()[:60])
+                await self._publish_gate_event(sentence, "pass", elapsed_ms)
                 yield sentence
             else:
                 logger.warning(
@@ -710,6 +739,7 @@ class Assistant(Agent):
                     elapsed_ms,
                     sentence.strip()[:60],
                 )
+                await self._publish_gate_event(sentence, "block", elapsed_ms)
                 yield GATE_HEDGE + " "
         except TimeoutError:
             logger.warning("gate timed out; letting sentence through")
@@ -749,7 +779,9 @@ class Assistant(Agent):
             except Exception:
                 logger.exception("Failed to push memory session to cloud")
 
-    async def _publish_moss_context(self, query: str, result) -> None:
+    async def _publish_moss_context(
+        self, query: str, result, elapsed_ms: float | None = None
+    ) -> None:
         """Publish a `moss_context` data message for the frontend panel.
 
         The payload shape is contractual — the frontend parser
@@ -776,7 +808,16 @@ class Assistant(Agent):
                 "data": {
                     "query": query,
                     "matches": matches,
-                    "time_taken_ms": getattr(result, "time_taken_ms", None),
+                    # Moss reports time_taken_ms as a whole number covering only
+                    # the vector comparison, which is sub-millisecond and so
+                    # rounds to 0. Prefer our own wall-clock measurement: it
+                    # includes embedding generation, which is most of the cost
+                    # and is time the user actually waits.
+                    "time_taken_ms": (
+                        round(elapsed_ms, 2)
+                        if elapsed_ms is not None
+                        else getattr(result, "time_taken_ms", None)
+                    ),
                     "timestamp": datetime.now(timezone.utc).timestamp(),
                 },
             }
@@ -802,10 +843,12 @@ class Assistant(Agent):
         Args:
             query: What to look up, in the user's own words.
         """
+        started = time.perf_counter()
         result = await self._moss.query(
             KNOWLEDGE_INDEX, query, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
         )
-        await self._publish_moss_context(query, result)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        await self._publish_moss_context(query, result, elapsed_ms)
 
         docs = getattr(result, "docs", None) or []
         snippets = [(getattr(d, "text", "") or "").strip() for d in docs]
@@ -836,6 +879,7 @@ class Assistant(Agent):
             )
 
         # top_k is deliberately far above the real count so nothing is truncated.
+        started = time.perf_counter()
         result = await self._moss.query(
             KNOWLEDGE_INDEX,
             category,
@@ -844,7 +888,10 @@ class Assistant(Agent):
                 filter={"field": "category", "condition": {"$eq": category}},
             ),
         )
-        await self._publish_moss_context(f"all {category} notes", result)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        await self._publish_moss_context(
+            f"all {category} notes", result, elapsed_ms
+        )
 
         docs = getattr(result, "docs", None) or []
         # Severe first, so the most important note is never buried at the bottom.

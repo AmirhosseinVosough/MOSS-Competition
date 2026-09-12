@@ -30,7 +30,10 @@ export type MessageContentProps = HTMLAttributes<HTMLDivElement>;
 export const MessageContent = ({ children, className, ...props }: MessageContentProps) => (
   <div
     className={cn(
-      'is-user:dark flex w-fit max-w-full min-w-0 flex-col gap-2 overflow-hidden text-sm',
+      // text-sm (14px) is a developer default. Bumped to 20px with looser leading:
+      // this transcript is how Bill confirms he was understood correctly, and it
+      // is worthless to him if he cannot read it.
+      'is-user:dark flex w-fit max-w-full min-w-0 flex-col gap-2 overflow-hidden text-xl leading-relaxed',
       'group-[.is-user]:bg-secondary group-[.is-user]:text-foreground group-[.is-user]:ml-auto group-[.is-user]:rounded-lg group-[.is-user]:px-4 group-[.is-user]:py-3',
       'group-[.is-assistant]:text-foreground',
       className

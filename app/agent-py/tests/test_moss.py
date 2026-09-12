@@ -139,8 +139,16 @@ async def test_search_care_notes_returns_joined_text_and_publishes_context(
     # Contractual keys consumed by the frontend parser.
     assert set(data) == {"query", "matches", "time_taken_ms", "timestamp"}
     assert data["query"] == "when is my heart appointment?"
-    assert data["time_taken_ms"] == 7.0
     assert isinstance(data["timestamp"], (int, float))
+
+    # The published duration is measured around the call, not taken from the
+    # SDK's own `time_taken_ms`. Moss reports that as a whole number covering
+    # only the vector comparison, so it rounds to 0 and made the UI read "0 ms"
+    # for every lookup. Our measurement includes embedding generation, which is
+    # most of the real cost.
+    assert data["time_taken_ms"] != 7.0, "should not echo the SDK's number"
+    assert isinstance(data["time_taken_ms"], (int, float))
+    assert data["time_taken_ms"] >= 0
 
     matches = data["matches"]
     assert len(matches) == 2

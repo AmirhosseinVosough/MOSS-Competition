@@ -34,20 +34,24 @@ export interface AppConfig {
 
 export const APP_CONFIG_DEFAULTS: AppConfig = {
   companyName: 'Moss',
-  pageTitle: 'Moss LiveKit Docs Helper',
+  pageTitle: 'Bill’s Companion',
   pageDescription:
-    'A voice assistant that answers LiveKit questions from a Moss knowledge base and remembers what you tell it',
+    'A voice companion for an older adult. Answers from his care records, remembers what he says, and never states a dose it cannot find in his notes.',
 
   supportsChatInput: true,
-  supportsVideoInput: true,
-  supportsScreenShare: true,
+  // Video and screen share are developer-demo features. For this user they are
+  // extra controls to be confused by, so they are off.
+  supportsVideoInput: false,
+  supportsScreenShare: false,
   isPreConnectBufferEnabled: true,
 
   logo: '/lk-logo.svg',
   accent: '#002cf2',
   logoDark: '/lk-logo-dark.svg',
   accentDark: '#1fd5f9',
-  startButtonText: 'Start call',
+  // "Start call" reads as a phone call to make. This is a button to talk to
+  // someone who is already there.
+  startButtonText: 'Talk to your assistant',
 
   // optional: audio visualization configuration
   // audioVisualizerType: 'bar',

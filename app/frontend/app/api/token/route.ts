@@ -61,11 +61,12 @@ export async function POST(req: Request) {
     } catch {
       body = undefined;
     }
-    const roomConfig = (body as { room_config?: unknown } | undefined)?.room_config
-      ? RoomConfiguration.fromJson(
-          (body as { room_config: object }).room_config,
-          { ignoreUnknownFields: true }
-        )
+    // Derive the accepted type from fromJson itself rather than importing
+    // protobuf's JsonValue, which is not a direct dependency here.
+    type RoomConfigJson = Parameters<typeof RoomConfiguration.fromJson>[0];
+    const rawRoomConfig = (body as { room_config?: RoomConfigJson } | undefined)?.room_config;
+    const roomConfig = rawRoomConfig
+      ? RoomConfiguration.fromJson(rawRoomConfig, { ignoreUnknownFields: true })
       : new RoomConfiguration();
 
     // Stamp `{ "user_id": <uuid> }` as the agent dispatch metadata. The agent reads this via
