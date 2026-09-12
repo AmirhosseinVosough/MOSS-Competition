@@ -578,3 +578,103 @@ async def test_gate_fails_open_when_retrieval_hangs() -> None:
     finally:
         agent_module.GATE_TIMEOUT_S = original
     assert "five hundred milligrams" in spoken
+
+
+# --- the memory journal -------------------------------------------------
+# Facts live only in the local session until on_exit pushes them, and the agent
+# aborts on shutdown often enough that relying on that push loses real data. The
+# journal is the crash insurance: one appended line per fact, replayed on the
+# next start.
+
+
+@pytest.fixture
+def journal(tmp_path, monkeypatch):
+    path = tmp_path / "journal.jsonl"
+    monkeypatch.setattr(agent_module, "JOURNAL_PATH", path)
+    return path
+
+
+def test_journal_round_trips_a_fact(journal) -> None:
+    from moss import DocumentInfo
+
+    agent_module.journal_append(
+        DocumentInfo(id="bill-1", text="His knee ached.", metadata={"patient_id": "bill"})
+    )
+
+    docs = agent_module.journal_read()
+    assert len(docs) == 1
+    assert docs[0].id == "bill-1"
+    assert docs[0].text == "His knee ached."
+    assert docs[0].metadata == {"patient_id": "bill"}
+
+
+def test_journal_skips_a_half_written_line(journal) -> None:
+    """A crash mid-write leaves a truncated final line. Earlier facts survive."""
+    journal.write_text(
+        '{"id":"bill-1","text":"First fact."}\n'
+        '{"id":"bill-2","text":"Second fact."}\n'
+        '{"id":"bill-3","text":"Third fa'  # killed mid-write
+    )
+
+    docs = agent_module.journal_read()
+    assert [d.id for d in docs] == ["bill-1", "bill-2"]
+
+
+def test_journal_read_is_empty_when_there_is_no_file(journal) -> None:
+    assert not journal.exists()
+    assert agent_module.journal_read() == []
+
+
+async def test_remember_fact_journals_what_it_writes(journal) -> None:
+    assistant = _wire(Assistant())
+
+    await assistant.remember_fact(None, "His knee ached after gardening.")
+
+    docs = agent_module.journal_read()
+    assert len(docs) == 1
+    assert docs[0].text == "His knee ached after gardening."
+    # Same document that went into the session.
+    assert docs[0].id == assistant._memory_session.add_docs_calls[0][0].id
+
+
+async def test_on_exit_clears_the_journal_only_after_a_successful_push(journal) -> None:
+    assistant = _wire(Assistant())
+    await assistant.remember_fact(None, "His knee ached.")
+    assert journal.exists()
+
+    await assistant.on_exit()
+
+    assert assistant._memory_session.pushed == 1
+    assert not journal.exists()
+
+
+async def test_a_failed_push_keeps_the_journal_for_the_next_run(journal) -> None:
+    """If the cloud push fails the facts are not safe yet, so the file stays."""
+    assistant = _wire(Assistant())
+    await assistant.remember_fact(None, "His knee ached.")
+
+    async def boom():
+        raise RuntimeError("cloud unreachable")
+
+    assistant._memory_session.push_index = boom
+
+    await assistant.on_exit()
+
+    assert journal.exists()
+    assert agent_module.journal_read()[0].text == "His knee ached."
+
+
+async def test_a_broken_journal_does_not_break_remembering(journal, monkeypatch) -> None:
+    """Journalling is insurance. It must never take down the conversation."""
+
+    def boom(_doc):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(agent_module, "journal_append", boom)
+    assistant = _wire(Assistant())
+
+    # remember_fact calls the real journal_append, so patch where it is looked up.
+    result = await assistant.remember_fact(None, "His knee ached.")
+
+    assert "remember" in result.lower()
+    assert len(assistant._memory_session.add_docs_calls) == 1
