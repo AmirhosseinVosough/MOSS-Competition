@@ -9,6 +9,7 @@ import {
   type AgentControlBarControls,
 } from '@/components/agents-ui/agent-control-bar';
 import { Shimmer } from '@/components/ai-elements/shimmer';
+import { CloudLatencyToggle } from '@/components/app/cloud-latency-toggle';
 import { MossLatencyHud } from '@/components/app/moss-latency-hud';
 import { MossResultsPanel } from '@/components/app/moss-results-panel';
 import { useMossContextEvents } from '@/hooks/useMossContextEvents';
@@ -231,6 +232,7 @@ export function AgentSessionView_01({
       {/* Live Knowledge Matches panel (Moss retrieval results) — renders beside the
           visualizer/transcript, inside the RoomContext provider. Hidden until matches arrive. */}
       <div className="pointer-events-auto absolute top-0 right-0 bottom-[170px] z-[60] hidden w-full max-w-sm overflow-y-auto overscroll-contain px-4 pt-40 pb-4 md:block">
+        <CloudLatencyToggle className="mb-3" />
         <MossLatencyHud className="mb-3" />
         <MossResultsPanel events={mossEvents} />
       </div>

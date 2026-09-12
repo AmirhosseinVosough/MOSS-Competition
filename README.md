@@ -165,3 +165,8 @@ Makes the assistant feel like it knows them. Not used for verification.
 search_knowledge is a function tool, so the AI has to decide to call it, wait, then generate. That's two AI round-trips before it speaks.
 remember_fact uses the cloud write path then reloads the whole index — slow, exactly the weakness I flagged earlier. SessionIndex fixes it.
 _publish_moss_context already sends time_taken_ms to the frontend — our latency display is half-built already.
+
+
+
+
+

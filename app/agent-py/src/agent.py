@@ -175,6 +175,14 @@ SPECULATIVE_MIN_CHARS = 10
 # STT model cannot flood the retrieval path.
 SPECULATIVE_MIN_GAP_MS = 350
 
+# Demo switch: pretend every lookup crosses a network to a hosted vector
+# database. 300ms is the middle of the 200-500ms range Moss cites for a remote
+# round trip. Measured locally we are at 5-9ms including embedding generation,
+# so this is roughly a 50x handicap -- which is the point. The claim that fast
+# retrieval changes what is possible is easy to assert and hard to believe; this
+# lets someone hear the difference instead of reading it.
+SIMULATED_CLOUD_LATENCY_S = 0.300
+
 # ---------------------------------------------------------------------------
 # Grounding gate
 #
@@ -319,6 +327,8 @@ class Assistant(Agent):
         self._spec_last_text = ""
         self._spec_last_at = 0.0
         self._spec_tasks: set = set()
+        # Toggled from the browser. Off unless someone deliberately turns it on.
+        self._simulate_cloud_latency = False
 
     async def on_enter(self) -> None:
         # Preload the knowledge index and open a writable session over memory so
@@ -383,11 +393,9 @@ class Assistant(Agent):
     async def _speculative_search(self, text: str, seq: int) -> None:
         """Search on a partial transcript. Never awaited by the audio path."""
         try:
-            started = time.perf_counter()
-            result = await self._moss.query(
+            result, elapsed_ms = await self._timed_query(
                 KNOWLEDGE_INDEX, text, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
             )
-            elapsed_ms = (time.perf_counter() - started) * 1000
             # A search started earlier can finish later. Only a newer sequence
             # number may replace the buffer.
             if seq < self._spec_best_seq:
@@ -459,7 +467,7 @@ class Assistant(Agent):
 
             notes, source = self._spec_notes, "while speaking"
             if not notes:
-                result = await self._moss.query(
+                result, turn_ms = await self._timed_query(
                     KNOWLEDGE_INDEX, text, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
                 )
                 notes = [
@@ -468,7 +476,7 @@ class Assistant(Agent):
                 ]
                 notes = [n for n in notes if n]
                 source = "at turn end"
-                await self._publish_moss_context(text, result)
+                await self._publish_moss_context(text, result, turn_ms)
 
             if notes:
                 turn_ctx.add_message(
@@ -649,7 +657,7 @@ class Assistant(Agent):
         from 1000mg -- they are near-identical as text and opposite as facts.
         Comparing the numbers themselves can.
         """
-        result = await self._moss.query(
+        result, _ = await self._timed_query(
             KNOWLEDGE_INDEX,
             sentence,
             QueryOptions(
@@ -691,6 +699,22 @@ class Assistant(Agent):
         if buffer.strip():
             async for out in self._gate_one(buffer):
                 yield out
+
+    async def _timed_query(self, index: str, query: str, options: QueryOptions):
+        """Run a Moss query and report how long it actually took.
+
+        Every lookup goes through here so that (a) the timing shown in the UI is
+        measured the same way everywhere, and (b) the cloud-latency simulation
+        has exactly one place to live rather than four.
+
+        The simulated delay is inside the measurement on purpose: when it is on,
+        the UI should show what the user is really waiting for.
+        """
+        started = time.perf_counter()
+        if self._simulate_cloud_latency:
+            await asyncio.sleep(SIMULATED_CLOUD_LATENCY_S)
+        result = await self._moss.query(index, query, options)
+        return result, (time.perf_counter() - started) * 1000
 
     async def _publish_gate_event(self, sentence: str, verdict: str, ms: float) -> None:
         """Tell the frontend a sentence was checked before it was spoken.
@@ -843,11 +867,9 @@ class Assistant(Agent):
         Args:
             query: What to look up, in the user's own words.
         """
-        started = time.perf_counter()
-        result = await self._moss.query(
+        result, elapsed_ms = await self._timed_query(
             KNOWLEDGE_INDEX, query, QueryOptions(top_k=3, alpha=SEARCH_ALPHA)
         )
-        elapsed_ms = (time.perf_counter() - started) * 1000
         await self._publish_moss_context(query, result, elapsed_ms)
 
         docs = getattr(result, "docs", None) or []
@@ -879,8 +901,7 @@ class Assistant(Agent):
             )
 
         # top_k is deliberately far above the real count so nothing is truncated.
-        started = time.perf_counter()
-        result = await self._moss.query(
+        result, elapsed_ms = await self._timed_query(
             KNOWLEDGE_INDEX,
             category,
             QueryOptions(
@@ -888,7 +909,6 @@ class Assistant(Agent):
                 filter={"field": "category", "condition": {"$eq": category}},
             ),
         )
-        elapsed_ms = (time.perf_counter() - started) * 1000
         await self._publish_moss_context(
             f"all {category} notes", result, elapsed_ms
         )
@@ -1077,9 +1097,35 @@ async def my_agent(ctx: JobContext):
         turn_handling={"preemptive_generation": {"enabled": True}},
     )
 
+    assistant = Assistant(room=ctx.room, user_id=user_id)
+
+    # Let the browser turn the cloud-latency simulation on and off mid-call.
+    # Doing it live is the whole value: the same agent, the same question, the
+    # only change being what a lookup costs. Describing that difference is easy
+    # to disbelieve; hearing it is not.
+    def _on_data(packet) -> None:
+        try:
+            raw = getattr(packet, "data", None)
+            if not raw:
+                return
+            message = json.loads(bytes(raw).decode("utf-8"))
+            if message.get("type") != "moss_simulate_cloud":
+                return
+            enabled = bool(message.get("enabled"))
+            assistant._simulate_cloud_latency = enabled
+            logger.info(
+                "cloud latency simulation %s (%.0fms per lookup)",
+                "ON" if enabled else "OFF",
+                SIMULATED_CLOUD_LATENCY_S * 1000 if enabled else 0,
+            )
+        except Exception:
+            logger.exception("could not handle data message from the browser")
+
+    ctx.room.on("data_received", _on_data)
+
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(room=ctx.room, user_id=user_id),
+        agent=assistant,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
