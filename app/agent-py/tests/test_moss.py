@@ -17,6 +17,8 @@ import json
 import pytest
 
 import agent as agent_module
+import grounding as grounding_module
+import journal as journal_module
 from agent import Assistant
 
 PATIENT_ID = agent_module.PATIENT_ID
@@ -485,7 +487,7 @@ def test_numbers_are_read_as_phrases_not_words() -> None:
     500mg dose, because the notes contain 500 and never 5 or 100. A gate that
     blocks correct information is worse than no gate.
     """
-    n = Assistant._numbers_in
+    n = grounding_module.numbers_in
     assert n("five hundred milligrams") == {"500"}
     assert n("one thousand milligrams") == {"1000"}
     assert n("twenty two") == {"22"}
@@ -497,7 +499,7 @@ def test_numbers_are_read_as_phrases_not_words() -> None:
 
 def test_only_specific_claims_are_checked() -> None:
     """Ordinary conversation must pass without a lookup."""
-    checkable = Assistant._is_checkable
+    checkable = grounding_module.is_checkable
     assert checkable("You take metformin, five hundred milligrams, twice daily.")
     assert checkable("Your appointment is on the fifteenth.")
     # No number to be wrong about.
@@ -598,18 +600,20 @@ async def test_gate_fails_open_when_retrieval_hangs() -> None:
 @pytest.fixture
 def journal(tmp_path, monkeypatch):
     path = tmp_path / "journal.jsonl"
-    monkeypatch.setattr(agent_module, "JOURNAL_PATH", path)
+    # journal_append/read resolve JOURNAL_PATH from their own module, so the
+    # patch has to land there rather than on agent.
+    monkeypatch.setattr(journal_module, "JOURNAL_PATH", path)
     return path
 
 
 def test_journal_round_trips_a_fact(journal) -> None:
     from moss import DocumentInfo
 
-    agent_module.journal_append(
+    journal_module.journal_append(
         DocumentInfo(id="bill-1", text="His knee ached.", metadata={"patient_id": "bill"})
     )
 
-    docs = agent_module.journal_read()
+    docs = journal_module.journal_read()
     assert len(docs) == 1
     assert docs[0].id == "bill-1"
     assert docs[0].text == "His knee ached."
@@ -624,13 +628,13 @@ def test_journal_skips_a_half_written_line(journal) -> None:
         '{"id":"bill-3","text":"Third fa'  # killed mid-write
     )
 
-    docs = agent_module.journal_read()
+    docs = journal_module.journal_read()
     assert [d.id for d in docs] == ["bill-1", "bill-2"]
 
 
 def test_journal_read_is_empty_when_there_is_no_file(journal) -> None:
     assert not journal.exists()
-    assert agent_module.journal_read() == []
+    assert journal_module.journal_read() == []
 
 
 async def test_remember_fact_journals_what_it_writes(journal) -> None:
@@ -638,7 +642,7 @@ async def test_remember_fact_journals_what_it_writes(journal) -> None:
 
     await assistant.remember_fact(None, "His knee ached after gardening.")
 
-    docs = agent_module.journal_read()
+    docs = journal_module.journal_read()
     assert len(docs) == 1
     assert docs[0].text == "His knee ached after gardening."
     # Same document that went into the session.
@@ -669,7 +673,7 @@ async def test_a_failed_push_keeps_the_journal_for_the_next_run(journal) -> None
     await assistant.on_exit()
 
     assert journal.exists()
-    assert agent_module.journal_read()[0].text == "His knee ached."
+    assert journal_module.journal_read()[0].text == "His knee ached."
 
 
 async def test_a_broken_journal_does_not_break_remembering(journal, monkeypatch) -> None:

@@ -2,15 +2,12 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
-import pathlib
 import re
 import textwrap
 import time
 import uuid
 from datetime import datetime, timezone
 
-from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -28,213 +25,24 @@ from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from moss import DocumentInfo, MossClient, QueryOptions
 
+from config import (
+    DEFAULT_USER_ID,
+    GATE_HEDGE,
+    GATE_TIMEOUT_S,
+    KNOWLEDGE_INDEX,
+    MEMORY_INDEX,
+    PATIENT_ID,
+    SEARCH_ALPHA,
+    SIMULATED_CLOUD_LATENCY_S,
+    SPECULATIVE_MIN_CHARS,
+    SPECULATIVE_MIN_GAP_MS,
+    SWEEPABLE_CATEGORIES,
+)
+from grounding import is_checkable, numbers_in
+from journal import journal_append, journal_clear, journal_read
+from moss_runtime import get_shared_client
+
 logger = logging.getLogger("agent")
-
-load_dotenv(".env.local")
-
-# Moss index names (overridable via env so create_index.py and the agent
-# stay in sync). `knowledge` backs RAG; `memory` is the per-user agentic
-# memory store. See agent-py/src/create_index.py.
-KNOWLEDGE_INDEX = os.getenv("MOSS_INDEX_NAME", "knowledge")
-MEMORY_INDEX = os.getenv("MOSS_MEMORY_INDEX_NAME", "memory")
-
-# Whose care records these are. Memory is scoped to the person being cared for,
-# not to the browser that happens to be connected: Bill may speak from more than
-# one device, and Sarah must see the same history he does. The starter's
-# per-browser user_id was right for a multi-tenant docs bot and wrong here.
-PATIENT_ID = os.getenv("PATIENT_ID", "bill")
-
-# Fallback identity used only when ctx.job.metadata is absent (e.g. when
-# running `uv run src/agent.py console`). Retained for logging and dispatch;
-# it no longer scopes memory.
-DEFAULT_USER_ID = "user_1"
-
-# Crash insurance for remembered facts.
-#
-# Facts are written to the local session in ~4.5ms and only pushed to the cloud
-# at the end of a conversation, because push_index triggers a cloud rebuild that
-# returns in ~2s and takes ~74s to complete. That trade is what makes remembering
-# fast, but it means a crash between the two loses everything learned -- and this
-# agent aborts on shutdown often enough (exit code -6, "mutex lock failed") that
-# the loss is routine rather than theoretical.
-#
-# So every fact is also appended to a plain file the instant it is learned.
-# Appending is O(1) and survives the process dying; the index cannot be saved
-# cheaply because saving it means rebuilding it. On startup anything still in the
-# file is replayed into the session, and the file is cleared once a push succeeds.
-JOURNAL_PATH = pathlib.Path(
-    os.getenv("MEMORY_JOURNAL_PATH")
-    or pathlib.Path(__file__).resolve().parent.parent / ".memory-journal.jsonl"
-)
-
-
-def journal_append(doc: DocumentInfo) -> None:
-    """Append one fact. Never raises -- the conversation matters more."""
-    try:
-        JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with JOURNAL_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps(
-                    {
-                        "id": doc.id,
-                        "text": doc.text,
-                        "metadata": doc.metadata or {},
-                        "ts": time.time(),
-                    }
-                )
-                + "\n"
-            )
-            fh.flush()
-            # Without fsync the line can sit in an OS buffer and die with the
-            # process, which would defeat the entire point of writing it.
-            os.fsync(fh.fileno())
-    except Exception:
-        logger.exception("could not journal fact %s", getattr(doc, "id", "?"))
-
-
-def journal_read() -> list[DocumentInfo]:
-    """Facts from a previous run that never reached the cloud."""
-    if not JOURNAL_PATH.exists():
-        return []
-    docs: list[DocumentInfo] = []
-    try:
-        for line in JOURNAL_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                # A half-written final line is expected after a crash. Skip it
-                # rather than discarding every fact that came before.
-                logger.warning("skipping malformed journal line")
-                continue
-            if entry.get("id") and entry.get("text"):
-                docs.append(
-                    DocumentInfo(
-                        id=entry["id"],
-                        text=entry["text"],
-                        metadata=entry.get("metadata") or {},
-                    )
-                )
-    except Exception:
-        logger.exception("could not read memory journal")
-    return docs
-
-
-def journal_clear() -> None:
-    """Called only after a push succeeds; the cloud now holds these facts."""
-    try:
-        JOURNAL_PATH.unlink(missing_ok=True)
-    except Exception:
-        logger.exception("could not clear memory journal")
-
-
-# One Moss client per worker process, with its knowledge index already loaded.
-# Building it per conversation cost ~2.5s of silence at the start of every call,
-# because each Assistant created its own client and re-downloaded the index.
-_shared_client: MossClient | None = None
-_shared_client_lock = asyncio.Lock()
-
-
-async def get_shared_client() -> MossClient:
-    """Return the process-wide Moss client, loading the knowledge index once.
-
-    The lock matters: without it two callers arriving together would both see an
-    empty slot and both pay the load.
-    """
-    global _shared_client
-    async with _shared_client_lock:
-        if _shared_client is None:
-            client = MossClient(
-                os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")
-            )
-            started = time.perf_counter()
-            await client.load_index(KNOWLEDGE_INDEX)
-            logger.info(
-                "Loaded Moss knowledge index '%s' in %.0fms (once per worker)",
-                KNOWLEDGE_INDEX,
-                (time.perf_counter() - started) * 1000,
-            )
-            _shared_client = client
-    return _shared_client
-
-# Categories that are small, bounded, and unsafe to sample. Ranking exists to trim
-# large result sets; these have nothing to trim, and picking a "best" allergy is how
-# a severe one goes unmentioned. list_care_category returns every document in one.
-SWEEPABLE_CATEGORIES = ("allergy", "medication", "appointment", "contact", "medical_alert")
-
-# Measured on the 41-document care index: pure semantic beat every hybrid setting
-# (6/6 correct vs 5/6), and keyword-leaning pulled in unrelated documents.
-SEARCH_ALPHA = 1.0
-
-# A partial shorter than this carries no searchable content -- the first interim
-# of an utterance routinely arrives empty or one word long.
-SPECULATIVE_MIN_CHARS = 10
-# Interims measured ~1030ms apart, so this rarely binds; it exists so a chattier
-# STT model cannot flood the retrieval path.
-SPECULATIVE_MIN_GAP_MS = 350
-
-# Demo switch: pretend every lookup crosses a network to a hosted vector
-# database. 300ms is the middle of the 200-500ms range Moss cites for a remote
-# round trip. Measured locally we are at 5-9ms including embedding generation,
-# so this is roughly a 50x handicap -- which is the point. The claim that fast
-# retrieval changes what is possible is easy to assert and hard to believe; this
-# lets someone hear the difference instead of reading it.
-SIMULATED_CLOUD_LATENCY_S = 0.300
-
-# ---------------------------------------------------------------------------
-# Grounding gate
-#
-# The agent must never speak a dose, a time or a phone number that is not in
-# Bill's notes. Checking every sentence before it is spoken costs one retrieval
-# per sentence -- affordable only because retrieval is ~5ms. At a hosted vector
-# database's 200-500ms this would add seconds to every reply.
-#
-# The check is deliberately narrow. Only sentences carrying a specific factual
-# claim are verified; conversation passes untouched. An over-eager gate that
-# hedges ordinary speech would make the agent useless, which is a worse failure
-# than the one it is guarding against.
-# ---------------------------------------------------------------------------
-
-# Spoken numbers, because the agent is instructed to say "five hundred" rather
-# than "500". Ordinals are included because dates are spoken as "the fifteenth".
-# These are parsed as phrases, not as separate words: "five hundred" is 500, and
-# reading it as {5, 100} once caused the gate to reject a correct dose.
-_NUMBER_UNITS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
-    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
-    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
-    "seventy": 70, "eighty": 80, "ninety": 90,
-    # Ordinals, for spoken dates.
-    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
-    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
-    "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
-    "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18,
-    "nineteenth": 19, "twentieth": 20, "thirtieth": 30,
-}
-_NUMBER_SCALES = {"hundred": 100, "thousand": 1000}
-
-# A sentence is only worth checking if it asserts something specific.
-_CLAIM_HINTS = (
-    "mg", "milligram", "microgram", "tablet", "capsule", "dose", "doses",
-    "pill", "pills", "take", "takes", "taking", "appointment", "allergic",
-    "allergy", "o'clock", "am", "pm", "morning", "afternoon", "evening",
-    "bedtime", "daily", "twice", "once", "number", "call",
-)
-
-# How long the gate may spend verifying one sentence before giving up and
-# letting it through. Retrieval measures ~5ms; this is a hang guard, not a
-# budget.
-GATE_TIMEOUT_S = 0.5
-
-# Said instead of an unsupported claim.
-GATE_HEDGE = (
-    "I am not certain about that one, so I would rather not say. "
-    "It is worth checking with Sarah."
-)
 
 
 class Assistant(Agent):
@@ -593,63 +401,6 @@ class Assistant(Agent):
 
             yield event
 
-    @staticmethod
-    def _numbers_in(text: str) -> set:
-        """Every number in a piece of text, as digit strings.
-
-        Handles digits ("500mg") and spoken phrases ("five hundred", "twenty
-        two", "the fifteenth"). Phrases are accumulated rather than read word by
-        word: "five hundred" is 500, not 5 and 100.
-        """
-        low = text.lower()
-        found = set(re.findall(r"\d+", low))
-
-        total = 0     # completed hundreds/thousands within the current phrase
-        current = 0   # the part being accumulated
-        seen = False
-
-        def flush():
-            nonlocal total, current, seen
-            if seen:
-                value = total + current
-                if value:
-                    found.add(str(value))
-            total, current, seen = 0, 0, False
-
-        for word in re.findall(r"[a-z]+", low):
-            if word in _NUMBER_UNITS:
-                current += _NUMBER_UNITS[word]
-                seen = True
-            elif word in _NUMBER_SCALES:
-                scale = _NUMBER_SCALES[word]
-                # "five hundred" -> 500; a bare "hundred" -> 100.
-                current = (current or 1) * scale
-                if scale >= 1000:
-                    total += current
-                    current = 0
-                seen = True
-            elif word == "and" and seen:
-                # "one hundred and twenty" keeps going.
-                continue
-            else:
-                flush()
-        flush()
-        return found
-
-    @staticmethod
-    def _is_checkable(sentence: str) -> bool:
-        """True if the sentence asserts something specific enough to verify.
-
-        Narrow on purpose: a gate that hedges ordinary conversation is worse than
-        no gate at all.
-        """
-        low = sentence.lower()
-        if not any(h in low for h in _CLAIM_HINTS):
-            return False
-        # A claim worth checking names a number -- a dose, a time, a date, a
-        # phone number. Advice without one has nothing to get factually wrong.
-        return bool(Assistant._numbers_in(sentence))
-
     async def _is_supported(self, sentence: str) -> bool:
         """Is every number in this sentence present in Bill's source records?
 
@@ -674,8 +425,8 @@ class Assistant(Agent):
         )
         if not evidence.strip():
             return False
-        supported = self._numbers_in(evidence)
-        claimed = self._numbers_in(sentence)
+        supported = numbers_in(evidence)
+        claimed = numbers_in(sentence)
         return claimed.issubset(supported)
 
     async def _gate(self, text_stream):
@@ -743,7 +494,7 @@ class Assistant(Agent):
     async def _gate_one(self, sentence: str):
         """Check a single sentence and yield it, or a hedge in its place."""
         try:
-            if self._moss is None or not self._is_checkable(sentence):
+            if self._moss is None or not is_checkable(sentence):
                 yield sentence
                 return
 
@@ -1076,7 +827,6 @@ async def my_agent(ctx: JobContext):
         ),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
-        turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         # Endpointing is left at its defaults deliberately.
         #
@@ -1094,7 +844,21 @@ async def my_agent(ctx: JobContext):
         #
         # preemptive_generation moved in here from its own argument, which is
         # deprecated in favour of turn_handling.
-        turn_handling={"preemptive_generation": {"enabled": True}},
+        # turn_detection MUST live inside turn_handling. When turn_handling is
+        # given at all, AgentSession reads turn detection from it and ignores the
+        # deprecated top-level argument outright:
+        #
+        #     raw_turn_detection = turn_handling.get("turn_detection", None)
+        #
+        # Passing turn_handling for preemptive_generation while leaving
+        # turn_detection outside silently disabled the semantic detector, and
+        # that is what was cutting Bill off mid-sentence -- nothing was left to
+        # judge whether he had finished a thought, so any pause ended his turn.
+        # It fails quietly: no warning, no error, just a worse conversation.
+        turn_handling={
+            "turn_detection": MultilingualModel(),
+            "preemptive_generation": {"enabled": True},
+        },
     )
 
     assistant = Assistant(room=ctx.room, user_id=user_id)
